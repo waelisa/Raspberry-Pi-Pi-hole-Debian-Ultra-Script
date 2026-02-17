@@ -5,7 +5,7 @@
 # Author:  Wael Isa
 # Website: https://www.wael.name
 # GitHub:  https://github.com/waelisa
-# Version: 2.1.1
+# Version: 2.1.2
 # License: MIT
 #
 # Description: Complete system optimization script for Raspberry Pi running
@@ -18,7 +18,7 @@
 # ============== CONFIGURATION ==============
 LOG_FILE="/var/log/pihole-ultra.log"
 BACKUP_DIR="/root/pihole-system-backups"
-SCRIPT_VERSION="2.1.1"
+SCRIPT_VERSION="2.1.2"
 MIN_DISK_SPACE_MB=500  # Minimum 500MB free space required
 MIN_MEMORY_MB=256      # Minimum 256MB free memory recommended
 exec > >(tee -a "$LOG_FILE") 2>&1
@@ -138,6 +138,7 @@ install_required_tools() {
 
     apt-get update -qq
 
+    # IMPORTANT: Ensure dselect is installed for rollback functionality
     if ! command -v dselect &> /dev/null; then
         echo -e "${YELLOW}Installing dselect for rollback functionality...${NC}"
         apt-get install -y dselect
@@ -185,7 +186,7 @@ verify_dbus() {
     fi
 }
 
-# Get config.txt path
+# Get config.txt path (IMPROVED for Bookworm compatibility)
 get_config_path() {
     if [ -f "/boot/firmware/config.txt" ]; then
         echo "/boot/firmware/config.txt"
@@ -196,7 +197,7 @@ get_config_path() {
     fi
 }
 
-# Estimate backup size
+# Estimate backup size (IMPROVED with config.txt size)
 estimate_backup_size() {
     echo -e "\n${BLUE}=== Estimating Backup Size ===${NC}"
 
@@ -212,6 +213,14 @@ estimate_backup_size() {
         local dnsmasq_size=$(du -sk /etc/dnsmasq.d 2>/dev/null | cut -f1)
         total_size=$((total_size + dnsmasq_size))
         echo -e "${YELLOW}  /etc/dnsmasq.d: $(numfmt --to=iec ${dnsmasq_size}K)${NC}"
+    fi
+
+    # Add boot config size
+    local config_path=$(get_config_path)
+    if [ -n "$config_path" ] && [ -f "$config_path" ]; then
+        local config_size=$(du -sk "$config_path" 2>/dev/null | cut -f1)
+        total_size=$((total_size + config_size))
+        echo -e "${YELLOW}  Boot config: $(numfmt --to=iec ${config_size}K)${NC}"
     fi
 
     local pkg_count=$(dpkg -l | grep -c "^ii")
@@ -235,7 +244,7 @@ estimate_backup_size() {
     fi
 }
 
-# Create system snapshot
+# Create system snapshot (IMPROVED with full boot config backup)
 create_snapshot() {
     local snapshot_name="pre-optimization-$(date +%Y%m%d-%H%M%S)"
     local snapshot_dir="${BACKUP_DIR}/${snapshot_name}"
@@ -261,10 +270,20 @@ create_snapshot() {
     [ -d "/etc/dnsmasq.d" ] && cp -r /etc/dnsmasq.d "${snapshot_dir}/" 2>/dev/null && echo -e "${GREEN}  ✅ dnsmasq config backed up${NC}"
     [ -f "/etc/pihole/adlists.list" ] && cp /etc/pihole/adlists.list "${snapshot_dir}/" 2>/dev/null && echo -e "${GREEN}  ✅ Adlists backed up${NC}"
 
+    # IMPROVED: Backup ALL boot configs (both possible locations)
     local config_path=$(get_config_path)
     if [ -n "$config_path" ]; then
         cp "$config_path" "${snapshot_dir}/config.txt.backup"
         echo -e "${GREEN}  ✅ Boot config backed up: ${config_path}${NC}"
+
+        # Also backup the entire boot directory for safety
+        if [ -d "/boot/firmware" ]; then
+            cp -r /boot/firmware "${snapshot_dir}/firmware-backup" 2>/dev/null
+            echo -e "${GREEN}  ✅ Full firmware directory backed up${NC}"
+        elif [ -d "/boot" ]; then
+            cp /boot/*.txt "${snapshot_dir}/" 2>/dev/null
+            echo -e "${GREEN}  ✅ Boot text files backed up${NC}"
+        fi
     fi
 
     echo -e "${YELLOW}Saving service states...${NC}"
@@ -281,7 +300,7 @@ create_snapshot() {
     CURRENT_BACKUP="$snapshot_name"
 }
 
-# IMPROVED: Rollback function with atomic package selection
+# IMPROVED: Rollback function with full boot config restoration
 rollback_system() {
     echo -e "\n${PURPLE}=== System Rollback ===${NC}"
 
@@ -333,7 +352,7 @@ rollback_system() {
         return 0
     fi
 
-    # IMPROVED: Save current selections before clearing (safety)
+    # Save current selections before clearing
     echo -e "${BLUE}Saving current package selections as emergency backup...${NC}"
     dpkg --get-selections > "${TEMP_SELECTIONS}.current"
 
@@ -364,12 +383,19 @@ rollback_system() {
     [ -d "$snapshot_dir/pihole" ] && cp -r "$snapshot_dir/pihole" /etc/ 2>/dev/null && echo -e "${GREEN}✅ Pi-hole config restored${NC}"
     [ -d "$snapshot_dir/dnsmasq.d" ] && cp -r "$snapshot_dir/dnsmasq.d" /etc/ 2>/dev/null && echo -e "${GREEN}✅ dnsmasq config restored${NC}"
 
+    # IMPROVED: Restore boot config from multiple possible backup locations
     if [ -f "$snapshot_dir/config.txt.backup" ]; then
         local config_path=$(get_config_path)
         if [ -n "$config_path" ]; then
             cp "$snapshot_dir/config.txt.backup" "$config_path"
             echo -e "${GREEN}✅ Boot config restored${NC}"
         fi
+    fi
+
+    # Restore full firmware backup if it exists
+    if [ -d "$snapshot_dir/firmware-backup" ]; then
+        cp -r "$snapshot_dir/firmware-backup"/* /boot/firmware/ 2>/dev/null
+        echo -e "${GREEN}✅ Full firmware directory restored${NC}"
     fi
 
     # Clean up temp file
@@ -576,17 +602,22 @@ verify_packages() {
     fi
 }
 
-# Placeholder for optimization functions
+# Placeholder for optimization functions (to be implemented in v2.2)
 run_full_optimization() {
     echo -e "\n${BLUE}=== Starting Full System Optimization ===${NC}"
-    echo -e "${YELLOW}This feature will be fully implemented in the next version${NC}"
-    echo -e "${YELLOW}For now, please use the individual options from the menu${NC}"
+    echo -e "${YELLOW}This feature will be fully implemented in version 2.2${NC}"
+    echo -e "${YELLOW}For now, please use the individual options from the menu:${NC}"
+    echo -e "${YELLOW}  • Option 3: Create System Snapshot${NC}"
+    echo -e "${YELLOW}  • Option 9: Cleanup Only (no changes)${NC}"
+    echo -e "${YELLOW}  • Option 7: Reinstall Critical Packages${NC}"
 }
 
-# Reinstall Pi-hole optional
+# Reinstall Pi-hole optional (to be implemented in v2.2)
 reinstall_pihole_optional() {
     echo -e "\n${BLUE}=== Pi-hole Reinstallation ===${NC}"
-    echo -e "${YELLOW}This feature will be fully implemented in the next version${NC}"
+    echo -e "${YELLOW}This feature will be fully implemented in version 2.2${NC}"
+    echo -e "${YELLOW}For now, you can manually reinstall Pi-hole with:${NC}"
+    echo -e "${YELLOW}  curl -sSL https://install.pi-hole.net | bash${NC}"
 }
 
 # ============== MENU SYSTEM ==============
@@ -682,11 +713,14 @@ main() {
                 read -p "Press Enter to continue..."
                 ;;
             0)
-                echo -e "\n${GREEN}Thank you for using Pi-hole Ultra Script!${NC}"
+                echo -e "\n${GREEN}══════════════════════════════════════════════════════════════${NC}"
+                echo -e "${GREEN}Thank you for using Pi-hole Ultra Script!${NC}"
                 echo -e "${GREEN}Created by Wael Isa - https://www.wael.name${NC}"
                 echo -e "${GREEN}Log file saved to: $LOG_FILE${NC}"
                 echo -e "\n${YELLOW}If this script helped you, star it on GitHub:${NC}"
                 echo -e "${YELLOW}https://github.com/waelisa/Raspberry-Pi-Pi-hole-Debian-Ultra-Script${NC}"
+                echo -e "\n${CYAN}Remember: A stable Pi-hole keeps the internet peaceful!${NC}"
+                echo -e "${GREEN}══════════════════════════════════════════════════════════════${NC}"
                 exit 0
                 ;;
             *)
