@@ -1,16 +1,17 @@
 #!/bin/bash
 # =============================================================================
-# Pi-hole Debian 12 Ultra Script - MENU DRIVEN WITH ROLLBACK
+# Pi-hole Debian Ultra Script - MENU DRIVEN WITH ROLLBACK
 # =============================================================================
 # Author:  Wael Isa
 # Website: https://www.wael.name
-# GitHub:  https://github.com/waelisa
-# Version: 2.1.2
+# GitHub:  https://github.com/waelisa/Raspberry-Pi-Pi-hole-Debian-Ultra-Script
+# Version: 2.1.3
 # License: MIT
 #
-# Description: Complete system optimization script for Raspberry Pi running
-#              Debian 12 (Bookworm) with Pi-hole. Includes safety features,
+# Description: Complete system optimization script for systems running
+#              Debian with Pi-hole. Includes safety features,
 #              snapshots, rollback capability, and automated updates.
+#              Compatible with Raspberry Pi and other Debian installations.
 #
 # Usage: sudo ./pihole-ultra.sh
 # =============================================================================
@@ -18,9 +19,10 @@
 # ============== CONFIGURATION ==============
 LOG_FILE="/var/log/pihole-ultra.log"
 BACKUP_DIR="/root/pihole-system-backups"
-SCRIPT_VERSION="2.1.2"
+SCRIPT_VERSION="2.1.3"
 MIN_DISK_SPACE_MB=500  # Minimum 500MB free space required
 MIN_MEMORY_MB=256      # Minimum 256MB free memory recommended
+DRY_RUN=false
 exec > >(tee -a "$LOG_FILE") 2>&1
 
 # ============== COLOR CODES FOR MENU ==============
@@ -36,6 +38,12 @@ NC='\033[0m' # No Color
 CURRENT_BACKUP=""
 MENU_CHOICE=""
 TEMP_SELECTIONS="/tmp/dpkg-selections.$$"
+DETECTED_DISTRO=""
+DETECTED_VERSION=""
+IS_RASPBERRY_PI=false
+RPI_MODEL=""
+ACTIVE_INTERFACE=""
+IS_WIFI_ACTIVE=false
 
 # ============== INITIAL CHECKS ==============
 check_root() {
@@ -45,10 +53,122 @@ check_root() {
     fi
 }
 
+# Display script information and what it does
+show_script_info() {
+    clear
+    echo -e "${CYAN}╔══════════════════════════════════════════════════════════════╗${NC}"
+    echo -e "${CYAN}║           Pi-hole Debian Ultra Script - INFORMATION          ║${NC}"
+    echo -e "${CYAN}╠══════════════════════════════════════════════════════════════╣${NC}"
+    echo -e "${CYAN}║${NC} This script optimizes your Debian system with Pi-hole by:    ${CYAN}║${NC}"
+    echo -e "${CYAN}║${NC}                                                                  ${CYAN}║${NC}"
+    echo -e "${CYAN}║${NC} 1. Creating system snapshots (backup) before any changes     ${CYAN}║${NC}"
+    echo -e "${CYAN}║${NC} 2. Removing unnecessary packages (orphaned)                  ${CYAN}║${NC}"
+    echo -e "${CYAN}║${NC} 3. Disabling non-essential services                           ${CYAN}║${NC}"
+    echo -e "${CYAN}║${NC} 4. Optimizing system for Pi-hole performance                  ${CYAN}${NC}"
+    echo -e "${CYAN}║${NC} 5. Cleaning temporary files and logs                           ${CYAN}║${NC}"
+    echo -e "${CYAN}║${NC} 6. Setting up automated Pi-hole updates                       ${CYAN}║${NC}"
+    echo -e "${CYAN}║${NC} 7. Fixing common issues (D-Bus, services)                     ${CYAN}║${NC}"
+    echo -e "${CYAN}║${NC} 8. Raspberry Pi specific optimizations (if detected)          ${CYAN}║${NC}"
+    echo -e "${CYAN}╠══════════════════════════════════════════════════════════════╣${NC}"
+    echo -e "${CYAN}║${NC} SAFETY FEATURES:                                               ${CYAN}║${NC}"
+    echo -e "${CYAN}║${NC} • Full system snapshots before optimization                   ${CYAN}║${NC}"
+    echo -e "${CYAN}║${NC} • Rollback capability to restore previous state               ${CYAN}║${NC}"
+    echo -e "${CYAN}║${NC} • Dry-run mode to preview changes without applying            ${CYAN}║${NC}"
+    echo -e "${CYAN}║${NC} • Network connectivity checks before disabling services       ${CYAN}║${NC}"
+    echo -e "${CYAN}║${NC} • Confirmation prompts for critical operations                ${CYAN}║${NC}"
+    echo -e "${CYAN}╚══════════════════════════════════════════════════════════════╝${NC}"
+    echo ""
+    read -p "Press Enter to continue to the main menu..."
+}
+
+# Detect active network interface
+detect_active_interface() {
+    echo -e "\n${BLUE}=== Detecting Active Network Connection ===${NC}"
+
+    # Get default route interface
+    ACTIVE_INTERFACE=$(ip route | grep default | awk '{print $5}' | head -1)
+
+    if [ -n "$ACTIVE_INTERFACE" ]; then
+        echo -e "${GREEN}✅ Default route via: $ACTIVE_INTERFACE${NC}"
+
+        # Check if it's a WiFi interface
+        if [[ "$ACTIVE_INTERFACE" == wlan* ]] || [[ "$ACTIVE_INTERFACE" == wlp* ]]; then
+            IS_WIFI_ACTIVE=true
+            echo -e "${YELLOW}⚠️  Active connection is via WIFI ($ACTIVE_INTERFACE)${NC}"
+            echo -e "${YELLOW}   Disabling WiFi would disconnect this session!${NC}"
+        else
+            IS_WIFI_ACTIVE=false
+            echo -e "${GREEN}✅ Active connection is via Ethernet (safe to disable WiFi)${NC}"
+        fi
+    else
+        echo -e "${RED}❌ Could not detect active network interface${NC}"
+        IS_WIFI_ACTIVE=false
+    fi
+}
+
+# Detect Debian version and compatibility
+detect_debian_version() {
+    if [ -f /etc/debian_version ]; then
+        DETECTED_VERSION=$(cat /etc/debian_version)
+        DETECTED_DISTRO="Debian"
+        echo -e "${GREEN}✅ Detected: Debian $DETECTED_VERSION${NC}"
+
+        # Check if it's actually Raspbian/Raspberry Pi OS (which is Debian-based)
+        if grep -q "Raspbian" /etc/os-release 2>/dev/null; then
+            DETECTED_DISTRO="Raspbian"
+            echo -e "${GREEN}✅ Detected: Raspbian/Debian $DETECTED_VERSION${NC}"
+        fi
+        return 0
+    elif [ -f /etc/os-release ]; then
+        # Try to get from os-release
+        source /etc/os-release
+        if [[ "$ID" == "debian" ]] || [[ "$ID_LIKE" == *"debian"* ]]; then
+            DETECTED_VERSION="$VERSION_ID"
+            DETECTED_DISTRO="$NAME"
+            echo -e "${GREEN}✅ Detected: $NAME $VERSION_ID${NC}"
+            return 0
+        fi
+    fi
+
+    echo -e "${YELLOW}⚠️  Warning: This doesn't appear to be a Debian-based system${NC}"
+    echo -e "${YELLOW}   Some features may not work correctly${NC}"
+    DETECTED_DISTRO="Unknown"
+    DETECTED_VERSION="Unknown"
+    return 1
+}
+
+# Detect if running on Raspberry Pi
+detect_raspberry_pi() {
+    if [ -f /proc/device-tree/model ]; then
+        RPI_MODEL=$(cat /proc/device-tree/model 2>/dev/null | tr -d '\0')
+        if [[ "$RPI_MODEL" == *"Raspberry Pi"* ]]; then
+            IS_RASPBERRY_PI=true
+            echo -e "${GREEN}✅ Raspberry Pi detected: $RPI_MODEL${NC}"
+            return 0
+        fi
+    fi
+
+    # Alternative detection methods
+    if grep -q "Raspberry Pi" /proc/cpuinfo 2>/dev/null; then
+        IS_RASPBERRY_PI=true
+        RPI_MODEL="Raspberry Pi (from cpuinfo)"
+        echo -e "${GREEN}✅ Raspberry Pi detected${NC}"
+        return 0
+    fi
+
+    IS_RASPBERRY_PI=false
+    return 1
+}
+
 # Pre-flight safety check
 pre_flight_check() {
     echo -e "\n${BLUE}=== Pre-Flight Safety Check ===${NC}"
     local checks_passed=true
+
+    # Detect system info
+    detect_debian_version
+    detect_raspberry_pi
+    detect_active_interface
 
     # Check 1: Available disk space
     local available_space=$(df / | awk 'NR==2 {print $4}')
@@ -113,15 +233,6 @@ pre_flight_check() {
         echo -e "${GREEN}  ✅ Package manager working${NC}"
     fi
 
-    # Check 7: Check if running on Raspberry Pi
-    echo -e "\n${YELLOW}Checking hardware...${NC}"
-    if grep -q "Raspberry Pi" /proc/device-tree/model 2>/dev/null; then
-        local model=$(cat /proc/device-tree/model 2>/dev/null | tr -d '\0')
-        echo -e "${GREEN}  ✅ Detected: $model${NC}"
-    else
-        echo -e "${YELLOW}  ⚠️  Not a Raspberry Pi - some features may not work${NC}"
-    fi
-
     echo -e "\n${BLUE}=== Pre-Flight Summary ===${NC}"
     if [ "$checks_passed" = true ]; then
         echo -e "${GREEN}✅ All critical checks passed!${NC}"
@@ -147,9 +258,9 @@ install_required_tools() {
         echo -e "${GREEN}✅ dselect already installed${NC}"
     fi
 
-    local tools=("curl" "wget" "git" "dnsutils" "numfmt")
+    local tools=("curl" "wget" "git" "dnsutils" "numfmt" "lsb-release" "deborphan" "rfkill" "ethtool")
     for tool in "${tools[@]}"; do
-        if ! command -v "$tool" &> /dev/null; then
+        if ! command -v "$tool" &> /dev/null && ! dpkg -l | grep -q "ii  $tool "; then
             echo -e "${YELLOW}Installing $tool...${NC}"
             apt-get install -y "$tool"
         fi
@@ -186,8 +297,9 @@ verify_dbus() {
     fi
 }
 
-# Get config.txt path (IMPROVED for Bookworm compatibility)
+# Get config.txt path
 get_config_path() {
+    # Raspberry Pi paths
     if [ -f "/boot/firmware/config.txt" ]; then
         echo "/boot/firmware/config.txt"
     elif [ -f "/boot/config.txt" ]; then
@@ -197,7 +309,7 @@ get_config_path() {
     fi
 }
 
-# Estimate backup size (IMPROVED with config.txt size)
+# Estimate backup size
 estimate_backup_size() {
     echo -e "\n${BLUE}=== Estimating Backup Size ===${NC}"
 
@@ -215,7 +327,7 @@ estimate_backup_size() {
         echo -e "${YELLOW}  /etc/dnsmasq.d: $(numfmt --to=iec ${dnsmasq_size}K)${NC}"
     fi
 
-    # Add boot config size
+    # Add boot config size if it exists
     local config_path=$(get_config_path)
     if [ -n "$config_path" ] && [ -f "$config_path" ]; then
         local config_size=$(du -sk "$config_path" 2>/dev/null | cut -f1)
@@ -244,7 +356,7 @@ estimate_backup_size() {
     fi
 }
 
-# Create system snapshot (IMPROVED with full boot config backup)
+# Create system snapshot
 create_snapshot() {
     local snapshot_name="pre-optimization-$(date +%Y%m%d-%H%M%S)"
     local snapshot_dir="${BACKUP_DIR}/${snapshot_name}"
@@ -270,16 +382,16 @@ create_snapshot() {
     [ -d "/etc/dnsmasq.d" ] && cp -r /etc/dnsmasq.d "${snapshot_dir}/" 2>/dev/null && echo -e "${GREEN}  ✅ dnsmasq config backed up${NC}"
     [ -f "/etc/pihole/adlists.list" ] && cp /etc/pihole/adlists.list "${snapshot_dir}/" 2>/dev/null && echo -e "${GREEN}  ✅ Adlists backed up${NC}"
 
-    # IMPROVED: Backup ALL boot configs (both possible locations)
+    # Backup boot configs if they exist
     local config_path=$(get_config_path)
     if [ -n "$config_path" ]; then
         cp "$config_path" "${snapshot_dir}/config.txt.backup"
         echo -e "${GREEN}  ✅ Boot config backed up: ${config_path}${NC}"
 
-        # Also backup the entire boot directory for safety
+        # Also backup boot directory if it exists
         if [ -d "/boot/firmware" ]; then
             cp -r /boot/firmware "${snapshot_dir}/firmware-backup" 2>/dev/null
-            echo -e "${GREEN}  ✅ Full firmware directory backed up${NC}"
+            echo -e "${GREEN}  ✅ Firmware directory backed up${NC}"
         elif [ -d "/boot" ]; then
             cp /boot/*.txt "${snapshot_dir}/" 2>/dev/null
             echo -e "${GREEN}  ✅ Boot text files backed up${NC}"
@@ -291,7 +403,18 @@ create_snapshot() {
 
     dpkg -l > "${snapshot_dir}/all-packages.txt"
     uname -a > "${snapshot_dir}/kernel-version.txt"
-    cat /proc/device-tree/model 2>/dev/null | tr -d '\0' > "${snapshot_dir}/hardware-model.txt"
+
+    # Save distribution info
+    cp /etc/os-release "${snapshot_dir}/os-release" 2>/dev/null
+    cp /etc/debian_version "${snapshot_dir}/debian-version" 2>/dev/null
+
+    # Save hardware info if available
+    if [ -f /proc/device-tree/model ]; then
+        cat /proc/device-tree/model 2>/dev/null | tr -d '\0' > "${snapshot_dir}/hardware-model.txt"
+    fi
+
+    # Save network config
+    ip addr show > "${snapshot_dir}/network-config.txt" 2>/dev/null
 
     echo -e "${GREEN}✅ Snapshot created: ${snapshot_name}${NC}"
     echo -e "${GREEN}   Location: ${snapshot_dir}${NC}"
@@ -300,7 +423,7 @@ create_snapshot() {
     CURRENT_BACKUP="$snapshot_name"
 }
 
-# IMPROVED: Rollback function with full boot config restoration
+# Rollback function
 rollback_system() {
     echo -e "\n${PURPLE}=== System Rollback ===${NC}"
 
@@ -383,7 +506,7 @@ rollback_system() {
     [ -d "$snapshot_dir/pihole" ] && cp -r "$snapshot_dir/pihole" /etc/ 2>/dev/null && echo -e "${GREEN}✅ Pi-hole config restored${NC}"
     [ -d "$snapshot_dir/dnsmasq.d" ] && cp -r "$snapshot_dir/dnsmasq.d" /etc/ 2>/dev/null && echo -e "${GREEN}✅ dnsmasq config restored${NC}"
 
-    # IMPROVED: Restore boot config from multiple possible backup locations
+    # Restore boot config from multiple possible backup locations
     if [ -f "$snapshot_dir/config.txt.backup" ]; then
         local config_path=$(get_config_path)
         if [ -n "$config_path" ]; then
@@ -394,8 +517,10 @@ rollback_system() {
 
     # Restore full firmware backup if it exists
     if [ -d "$snapshot_dir/firmware-backup" ]; then
-        cp -r "$snapshot_dir/firmware-backup"/* /boot/firmware/ 2>/dev/null
-        echo -e "${GREEN}✅ Full firmware directory restored${NC}"
+        if [ -d "/boot/firmware" ]; then
+            cp -r "$snapshot_dir/firmware-backup"/* /boot/firmware/ 2>/dev/null
+            echo -e "${GREEN}✅ Firmware directory restored${NC}"
+        fi
     fi
 
     # Clean up temp file
@@ -479,11 +604,28 @@ setup_pihole_updates() {
 quick_system_info() {
     echo -e "\n${BLUE}=== Quick System Information ===${NC}"
     echo -e "${GREEN}Hostname:${NC} $(hostname)"
+    echo -e "${GREEN}OS:${NC} $DETECTED_DISTRO $DETECTED_VERSION"
     echo -e "${GREEN}Kernel:${NC} $(uname -r)"
     echo -e "${GREEN}Uptime:${NC} $(uptime -p)"
     echo -e "${GREEN}Memory:${NC} $(free -h | awk '/^Mem:/ {print $3"/"$2}')"
     echo -e "${GREEN}Disk:${NC} $(df -h / | awk 'NR==2 {print $3"/"$2 " ("$5")"}')"
-    echo -e "${GREEN}Pi-hole:${NC} $(pihole status | head -1)"
+    echo -e "${GREEN}Active Network:${NC} $ACTIVE_INTERFACE ($([ "$IS_WIFI_ACTIVE" = true ] && echo "WiFi" || echo "Ethernet"))"
+
+    if [ "$IS_RASPBERRY_PI" = true ]; then
+        echo -e "${GREEN}Hardware:${NC} $RPI_MODEL"
+        # Get CPU temperature if available
+        if [ -f /sys/class/thermal/thermal_zone0/temp ]; then
+            CPU_TEMP=$(($(cat /sys/class/thermal/thermal_zone0/temp) / 1000))
+            echo -e "${GREEN}CPU Temp:${NC} ${CPU_TEMP}°C"
+        fi
+    fi
+
+    if command -v pihole &> /dev/null; then
+        echo -e "${GREEN}Pi-hole:${NC} $(pihole status | head -1)"
+    else
+        echo -e "${YELLOW}Pi-hole:${NC} Not installed"
+    fi
+
     echo -e "${GREEN}D-Bus:${NC} $(systemctl is-active dbus)"
     echo -e "${GREEN}Failed Services:${NC} $(systemctl --failed | grep -c "loaded failed" || echo "0")"
 }
@@ -504,8 +646,15 @@ view_system_health() {
     echo -e "\n${YELLOW}Disk Health:${NC}"
     df -h | grep -E "^/dev|Filesystem"
 
-    echo -e "\n${YELLOW}Pi-hole Status:${NC}"
-    pihole status
+    if [ "$IS_RASPBERRY_PI" = true ]; then
+        echo -e "\n${YELLOW}Raspberry Pi Specific:${NC}"
+        vcgencmd measure_temp 2>/dev/null && vcgencmd get_throttled 2>/dev/null
+    fi
+
+    if command -v pihole &> /dev/null; then
+        echo -e "\n${YELLOW}Pi-hole Status:${NC}"
+        pihole status
+    fi
 }
 
 # Fix D-Bus
@@ -562,85 +711,500 @@ cleanup_only() {
 
 # Verify packages
 verify_packages() {
-    echo -e "\n${BLUE}=== Verifying critical Raspberry Pi packages ===${NC}"
+    echo -e "\n${BLUE}=== Verifying critical packages ===${NC}"
 
     local critical_pkgs=(
-        "raspberrypi-kernel"
-        "raspberrypi-sys-mods"
-        "raspi-config"
-        "raspi-utils"
-        "rpi-eeprom"
+        "ca-certificates"
+        "curl"
+        "wget"
+        "gnupg"
+        "apt-utils"
+        "systemd"
+        "dbus"
         "python3"
     )
 
+    # Add Raspberry Pi specific packages if on RPi
+    if [ "$IS_RASPBERRY_PI" = true ]; then
+        critical_pkgs+=(
+            "raspberrypi-kernel"
+            "raspberrypi-bootloader"
+            "raspberrypi-sys-mods"
+            "raspi-config"
+            "raspi-utils"
+            "rpi-eeprom"
+            "libraspberrypi-bin"
+            "libraspberrypi-dev"
+            "libraspberrypi-doc"
+            "libraspberrypi0"
+        )
+        echo -e "${YELLOW}Raspberry Pi detected: Including Pi-specific packages${NC}"
+    fi
+
     local all_good=true
+    local missing_pkgs=()
+    local installed_pkgs=()
 
     for pkg in "${critical_pkgs[@]}"; do
         if dpkg -l | grep -q "^ii.*$pkg"; then
             echo -e "${GREEN}✅ $pkg is installed${NC}"
+            installed_pkgs+=("$pkg")
         else
-            echo -e "${YELLOW}⚠️  $pkg is NOT installed - this may be normal${NC}"
-            if [[ "$pkg" == "python3" ]] || [[ "$pkg" == "raspberrypi-kernel" ]]; then
-                all_good=false
-            fi
+            echo -e "${YELLOW}⚠️  $pkg is NOT installed${NC}"
+            missing_pkgs+=("$pkg")
+            all_good=false
         fi
     done
 
-    if [ "$all_good" = false ]; then
+    if [ "$all_good" = false ] && [ ${#missing_pkgs[@]} -gt 0 ]; then
         echo ""
-        echo -e "${YELLOW}⚠️  Some critical packages appear to be missing.${NC}"
-        read -p "Do you want to attempt reinstalling missing packages? (y/N): " -n 1 -r
+        echo -e "${YELLOW}⚠️  Some packages appear to be missing.${NC}"
+        read -p "Do you want to attempt installing missing packages? (y/N): " -n 1 -r
         echo
         if [[ $REPLY =~ ^[Yy]$ ]]; then
-            for pkg in "${critical_pkgs[@]}"; do
-                if ! dpkg -l | grep -q "^ii.*$pkg"; then
-                    echo "Installing $pkg..."
-                    apt install -y "$pkg"
-                fi
+            apt update
+            for pkg in "${missing_pkgs[@]}"; do
+                echo "Installing $pkg..."
+                apt install -y "$pkg"
             done
+            echo -e "${GREEN}✅ Missing packages installed${NC}"
         fi
+    else
+        echo -e "${GREEN}✅ All critical packages are installed${NC}"
     fi
 }
 
-# Placeholder for optimization functions (to be implemented in v2.2)
-run_full_optimization() {
-    echo -e "\n${BLUE}=== Starting Full System Optimization ===${NC}"
-    echo -e "${YELLOW}This feature will be fully implemented in version 2.2${NC}"
-    echo -e "${YELLOW}For now, please use the individual options from the menu:${NC}"
-    echo -e "${YELLOW}  • Option 3: Create System Snapshot${NC}"
-    echo -e "${YELLOW}  • Option 9: Cleanup Only (no changes)${NC}"
-    echo -e "${YELLOW}  • Option 7: Reinstall Critical Packages${NC}"
+# NEW: Clean up old snapshots to save space
+cleanup_snapshots() {
+    echo -e "\n${BLUE}=== Snapshot Cleanup ===${NC}"
+
+    if [ ! -d "$BACKUP_DIR" ]; then
+        echo -e "${YELLOW}No snapshots directory found.${NC}"
+        return
+    fi
+
+    local snapshots=($(ls -1 "$BACKUP_DIR" 2>/dev/null | sort))
+
+    if [ ${#snapshots[@]} -eq 0 ]; then
+        echo -e "${YELLOW}No snapshots found to clean up.${NC}"
+        return
+    fi
+
+    echo -e "${YELLOW}Current snapshots:${NC}"
+    for i in "${!snapshots[@]}"; do
+        local size=$(du -sh "${BACKUP_DIR}/${snapshots[$i]}" 2>/dev/null | cut -f1)
+        echo "$((i+1)). ${snapshots[$i]} (${size})"
+    done
+
+    echo ""
+    echo "Options:"
+    echo "1. Remove all snapshots"
+    echo "2. Remove snapshots older than 30 days"
+    echo "3. Keep only the most recent snapshot"
+    echo "4. Select specific snapshots to remove"
+    echo "0. Cancel"
+
+    read -p "Select option: " cleanup_choice
+
+    case $cleanup_choice in
+        1)
+            echo -e "${RED}WARNING: This will delete ALL snapshots!${NC}"
+            read -p "Are you absolutely sure? (type 'yes' to confirm): " confirm
+            if [ "$confirm" = "yes" ]; then
+                rm -rf "${BACKUP_DIR:?}"/*
+                echo -e "${GREEN}✅ All snapshots removed${NC}"
+            fi
+            ;;
+        2)
+            echo -e "${YELLOW}Removing snapshots older than 30 days...${NC}"
+            find "$BACKUP_DIR" -type d -mtime +30 -exec rm -rf {} \; 2>/dev/null
+            echo -e "${GREEN}✅ Old snapshots removed${NC}"
+            ;;
+        3)
+            if [ ${#snapshots[@]} -gt 1 ]; then
+                latest="${snapshots[-1]}"
+                for snapshot in "${snapshots[@]}"; do
+                    if [ "$snapshot" != "$latest" ]; then
+                        rm -rf "${BACKUP_DIR}/$snapshot"
+                    fi
+                done
+                echo -e "${GREEN}✅ Kept only: $latest${NC}"
+            else
+                echo -e "${YELLOW}Only one snapshot exists, nothing to remove${NC}"
+            fi
+            ;;
+        4)
+            read -p "Enter snapshot numbers to remove (comma-separated, e.g., 1,3,5): " remove_list
+            IFS=',' read -ra indices <<< "$remove_list"
+            for idx in "${indices[@]}"; do
+                if [[ "$idx" =~ ^[0-9]+$ ]] && [ "$idx" -le "${#snapshots[@]}" ]; then
+                    snapshot="${snapshots[$((idx-1))]}"
+                    rm -rf "${BACKUP_DIR}/$snapshot"
+                    echo -e "${GREEN}✅ Removed: $snapshot${NC}"
+                fi
+            done
+            ;;
+        0)
+            echo -e "${YELLOW}Cancelled${NC}"
+            ;;
+        *)
+            echo -e "${RED}Invalid option${NC}"
+            ;;
+    esac
 }
 
-# Reinstall Pi-hole optional (to be implemented in v2.2)
-reinstall_pihole_optional() {
-    echo -e "\n${BLUE}=== Pi-hole Reinstallation ===${NC}"
-    echo -e "${YELLOW}This feature will be fully implemented in version 2.2${NC}"
-    echo -e "${YELLOW}For now, you can manually reinstall Pi-hole with:${NC}"
-    echo -e "${YELLOW}  curl -sSL https://install.pi-hole.net | bash${NC}"
+# Dry Run Mode - Show what would be removed without actually removing
+dry_run_optimization() {
+    echo -e "\n${BLUE}=== DRY RUN MODE - Optimization Preview ===${NC}"
+    echo -e "${YELLOW}This will show what would be removed without making any changes${NC}\n"
+
+    # Check if Pi-hole is installed
+    if ! command -v pihole &> /dev/null; then
+        echo -e "${RED}❌ Pi-hole is not installed. Please install Pi-hole first.${NC}"
+        return 1
+    fi
+
+    # Show orphaned packages that would be removed
+    echo -e "${PURPLE}Packages that would be removed (orphaned):${NC}"
+    local orphans=$(deborphan)
+    local orphan_count=0
+    if [ -n "$orphans" ]; then
+        echo "$orphans" | while read pkg; do
+            echo -e "  ${YELLOW}→ $pkg${NC}"
+            orphan_count=$((orphan_count + 1))
+        done
+    else
+        echo -e "  ${GREEN}None found${NC}"
+    fi
+    echo -e "${GREEN}Total orphaned packages: $orphan_count${NC}\n"
+
+    # Show services that would be disabled (non-essential)
+    echo -e "${PURPLE}Services that would be analyzed for disabling:${NC}"
+    local services_to_check=(
+        "bluetooth"
+        "hciuart"
+        "triggerhappy"
+        "alsa-state"
+        "console-setup"
+        "keyboard-setup"
+        "raspi-config"
+        "wpa_supplicant"
+    )
+
+    for service in "${services_to_check[@]}"; do
+        if systemctl is-enabled "$service" 2>/dev/null | grep -q "enabled"; then
+            echo -e "  ${YELLOW}→ $service (currently enabled)${NC}"
+        fi
+    done
+
+    # WiFi disabling warning if applicable
+    if [ "$IS_WIFI_ACTIVE" = true ]; then
+        echo -e "\n${RED}⚠️  WARNING: You are connected via WiFi!${NC}"
+        echo -e "${YELLOW}   The optimization would normally disable WiFi, which would${NC}"
+        echo -e "${YELLOW}   disconnect this session. You will be prompted about this.${NC}"
+    fi
+
+    # Show packages that would be installed (Raspberry Pi specific)
+    if [ "$IS_RASPBERRY_PI" = true ]; then
+        echo -e "\n${PURPLE}Raspberry Pi packages that would be verified/installed:${NC}"
+        local rpi_pkgs=(
+            "raspberrypi-kernel"
+            "raspberrypi-bootloader"
+            "raspi-config"
+            "rpi-eeprom"
+        )
+        for pkg in "${rpi_pkgs[@]}"; do
+            if ! dpkg -l | grep -q "^ii.*$pkg"; then
+                echo -e "  ${YELLOW}→ $pkg (would be installed)${NC}"
+            fi
+        done
+    fi
+
+    # Show systemd journal cleanup
+    echo -e "\n${PURPLE}System logs that would be cleaned:${NC}"
+    local journal_size=$(journalctl --disk-usage 2>/dev/null | awk '{print $3 $4}' || echo "unknown")
+    echo -e "  ${YELLOW}→ Journal current size: $journal_size (would be reduced to 100MB)${NC}"
+
+    # Show cache cleanup
+    echo -e "\n${PURPLE}Caches that would be cleaned:${NC}"
+    echo -e "  ${YELLOW}→ APT cache (apt clean)${NC}"
+    echo -e "  ${YELLOW}→ Temporary files (/tmp, /var/tmp)${NC}"
+
+    echo -e "\n${GREEN}✅ Dry run completed - no changes were made${NC}"
+}
+
+# Reinstall Raspberry Pi specific components
+reinstall_rpi_components() {
+    echo -e "\n${BLUE}=== Raspberry Pi Component Reinstallation ===${NC}"
+
+    if [ "$IS_RASPBERRY_PI" = false ]; then
+        echo -e "${RED}❌ This is not a Raspberry Pi. This option is only for Raspberry Pi hardware.${NC}"
+        return 1
+    fi
+
+    echo -e "${YELLOW}This will reinstall critical Raspberry Pi components:${NC}"
+    echo -e "  • Raspberry Pi kernel"
+    echo -e "  • Raspberry Pi bootloader"
+    echo -e "  • Raspberry Pi firmware"
+    echo -e "  • VideoCore utilities"
+    echo -e "  • EEPROM updates"
+    echo ""
+
+    read -p "Proceed with reinstallation? (y/N): " -n 1 -r
+    echo
+    if [[ ! $REPLY =~ ^[Yy]$ ]]; then
+        echo -e "${YELLOW}Reinstallation cancelled${NC}"
+        return 0
+    fi
+
+    # Backup current config
+    local config_path=$(get_config_path)
+    if [ -n "$config_path" ]; then
+        cp "$config_path" "${config_path}.backup-$(date +%Y%m%d-%H%M%S)"
+        echo -e "${GREEN}✅ Boot config backed up${NC}"
+    fi
+
+    # Reinstall kernel and firmware
+    echo -e "${YELLOW}Reinstalling Raspberry Pi kernel...${NC}"
+    apt install --reinstall -y raspberrypi-kernel raspberrypi-bootloader
+
+    echo -e "${YELLOW}Reinstalling firmware...${NC}"
+    apt install --reinstall -y raspberrypi-sys-mods raspi-config raspi-utils
+
+    echo -e "${YELLOW}Reinstalling VideoCore libraries...${NC}"
+    apt install --reinstall -y libraspberrypi-bin libraspberrypi-dev libraspberrypi-doc libraspberrypi0
+
+    echo -e "${YELLOW}Updating EEPROM...${NC}"
+    apt install --reinstall -y rpi-eeprom
+    rpi-eeprom-update -a
+
+    echo -e "${YELLOW}Reconfiguring raspi-config...${NC}"
+    dpkg-reconfigure raspi-config
+
+    echo -e "${GREEN}✅ Raspberry Pi components reinstalled${NC}"
+    echo -e "${YELLOW}⚠️  A reboot is recommended to apply changes${NC}"
+
+    read -p "Reboot now? (y/N): " -n 1 -r
+    echo
+    if [[ $REPLY =~ ^[Yy]$ ]]; then
+        reboot
+    fi
+}
+
+# Full Optimization with Bloat Removal
+run_full_optimization() {
+    echo -e "\n${BLUE}=== Starting Full System Optimization ===${NC}"
+    echo -e "${YELLOW}This process will:${NC}"
+    echo -e "  1. Create a system snapshot (backup)"
+    echo -e "  2. Remove orphaned packages (with confirmation)"
+    echo -e "  3. Disable unnecessary services"
+    echo -e "  4. Apply system optimizations"
+    echo -e "  5. Clean temporary files and logs"
+    echo -e "  6. Update system packages"
+    echo -e "  7. Optimize Pi-hole"
+    echo ""
+
+    read -p "Proceed with full optimization? (y/N): " -n 1 -r
+    echo
+    if [[ ! $REPLY =~ ^[Yy]$ ]]; then
+        echo -e "${YELLOW}Optimization cancelled${NC}"
+        return 0
+    fi
+
+    # Step 1: Create snapshot
+    echo -e "\n${YELLOW}Step 1: Creating system snapshot...${NC}"
+    if ! create_snapshot; then
+        echo -e "${RED}❌ Failed to create snapshot. Aborting optimization.${NC}"
+        return 1
+    fi
+
+    # Check if Pi-hole is installed
+    if ! command -v pihole &> /dev/null; then
+        echo -e "${RED}❌ Pi-hole is not installed. Please install Pi-hole first.${NC}"
+        return 1
+    fi
+
+    # Step 2: Remove orphaned packages with confirmation
+    echo -e "\n${YELLOW}Step 2: Checking for orphaned packages...${NC}"
+    local orphans=$(deborphan)
+    if [ -n "$orphans" ]; then
+        echo -e "${PURPLE}The following orphaned packages were found:${NC}"
+        echo "$orphans" | while read pkg; do
+            echo -e "  ${YELLOW}→ $pkg${NC}"
+        done
+        echo ""
+        read -p "Remove these orphaned packages? (y/N): " -n 1 -r
+        echo
+        if [[ $REPLY =~ ^[Yy]$ ]]; then
+            echo "$orphans" | xargs apt-get remove --purge -y
+            echo -e "${GREEN}✅ Orphaned packages removed${NC}"
+        else
+            echo -e "${YELLOW}⚠️  Skipping orphaned package removal${NC}"
+        fi
+    else
+        echo -e "${GREEN}✅ No orphaned packages found${NC}"
+    fi
+
+    # Step 3: Disable unnecessary services
+    echo -e "\n${YELLOW}Step 3: Disabling unnecessary services...${NC}"
+    local services_to_disable=(
+        "bluetooth"
+        "hciuart"
+        "triggerhappy"
+        "alsa-state"
+        "console-setup"
+        "keyboard-setup"
+    )
+
+    # Check WiFi status before disabling
+    if [ "$IS_WIFI_ACTIVE" = true ]; then
+        echo -e "${RED}⚠️  You are connected via WiFi!${NC}"
+        read -p "Do you want to disable WiFi services? This may disconnect you! (y/N): " -n 1 -r
+        echo
+        if [[ $REPLY =~ ^[Yy]$ ]]; then
+            services_to_disable+=("wpa_supplicant")
+            echo -e "${YELLOW}WiFi will be disabled${NC}"
+        else
+            echo -e "${GREEN}WiFi services will be preserved${NC}"
+        fi
+    else
+        # Safe to disable WiFi on Ethernet connection
+        services_to_disable+=("wpa_supplicant")
+    fi
+
+    for service in "${services_to_disable[@]}"; do
+        if systemctl is-enabled "$service" 2>/dev/null | grep -q "enabled"; then
+            systemctl stop "$service" 2>/dev/null
+            systemctl disable "$service" 2>/dev/null
+            echo -e "${GREEN}✅ Disabled $service${NC}"
+        fi
+    done
+
+    # Step 4: Raspberry Pi specific optimizations
+    if [ "$IS_RASPBERRY_PI" = true ]; then
+        echo -e "\n${YELLOW}Step 4: Applying Raspberry Pi optimizations...${NC}"
+
+        # Optimize boot/config.txt with precise checks
+        local config_path=$(get_config_path)
+        if [ -n "$config_path" ]; then
+            local changes_made=false
+
+            # Check and add gpu_mem if not set
+            if ! grep -q "^gpu_mem=" "$config_path"; then
+                echo -e "\n# Pi-hole optimizations" >> "$config_path"
+                echo "gpu_mem=16" >> "$config_path"
+                changes_made=true
+                echo -e "${GREEN}✅ Added gpu_mem=16${NC}"
+            fi
+
+            # Check and add disable_splash if not set
+            if ! grep -q "^disable_splash=" "$config_path"; then
+                echo "disable_splash=1" >> "$config_path"
+                changes_made=true
+                echo -e "${GREEN}✅ Added disable_splash=1${NC}"
+            fi
+
+            # Check and add boot_delay if not set or different
+            if ! grep -q "^boot_delay=" "$config_path"; then
+                echo "boot_delay=0" >> "$config_path"
+                changes_made=true
+                echo -e "${GREEN}✅ Added boot_delay=0${NC}"
+            elif grep -q "^boot_delay=[1-9]" "$config_path"; then
+                # Replace existing boot_delay if it's >0
+                sed -i 's/^boot_delay=[0-9]\+/boot_delay=0/' "$config_path"
+                changes_made=true
+                echo -e "${GREEN}✅ Updated boot_delay to 0${NC}"
+            fi
+
+            if [ "$changes_made" = false ]; then
+                echo -e "${GREEN}✅ Boot config already optimized${NC}"
+            fi
+        fi
+
+        # Disable WiFi if safe and user confirmed
+        if [ "$IS_WIFI_ACTIVE" = false ] && command -v rfkill &> /dev/null; then
+            read -p "Disable WiFi hardware (saves power)? (y/N): " -n 1 -r
+            echo
+            if [[ $REPLY =~ ^[Yy]$ ]]; then
+                rfkill block wifi
+                echo -e "${GREEN}✅ WiFi disabled${NC}"
+            fi
+        fi
+    fi
+
+    # Step 5: Cleaning system
+    echo -e "\n${YELLOW}Step 5: Cleaning system...${NC}"
+    apt autoremove --purge -y
+    apt autoclean -y
+    apt clean
+    journalctl --vacuum-size=100M
+    rm -rf /tmp/*
+    rm -rf /var/tmp/*
+    echo -e "${GREEN}✅ System cleaned${NC}"
+
+    # Step 6: Update system
+    echo -e "\n${YELLOW}Step 6: Updating system packages...${NC}"
+    apt update
+    apt upgrade -y
+    echo -e "${GREEN}✅ System updated${NC}"
+
+    # Step 7: Optimize Pi-hole
+    echo -e "\n${YELLOW}Step 7: Optimizing Pi-hole...${NC}"
+    pihole updateGravity
+    pihole -up
+    echo -e "${GREEN}✅ Pi-hole optimized${NC}"
+
+    # Final step: Check D-Bus and fix if needed
+    echo -e "\n${YELLOW}Final Step: Verifying services...${NC}"
+    if ! systemctl is-active --quiet dbus; then
+        echo -e "${YELLOW}⚠️  D-Bus not running. Attempting to fix...${NC}"
+        fix_dbus
+    fi
+
+    echo -e "\n${GREEN}✅ Full optimization completed!${NC}"
+    echo -e "${YELLOW}⚠️  A system reboot is recommended to apply all changes${NC}"
+
+    read -p "Reboot now? (y/N): " -n 1 -r
+    echo
+    if [[ $REPLY =~ ^[Yy]$ ]]; then
+        echo "Rebooting in 10 seconds... Press Ctrl+C to cancel"
+        sleep 10
+        reboot
+    else
+        echo -e "${YELLOW}Please reboot manually later: sudo reboot${NC}"
+    fi
 }
 
 # ============== MENU SYSTEM ==============
 show_menu() {
     clear
     echo -e "${CYAN}╔══════════════════════════════════════════════════════════════╗${NC}"
-    echo -e "${CYAN}║     Pi-hole Debian 12 Ultra Script v${SCRIPT_VERSION}                ║${NC}"
+    echo -e "${CYAN}║     Pi-hole Debian Ultra Script v${SCRIPT_VERSION}                    ║${NC}"
     echo -e "${CYAN}║     by Wael Isa (https://www.wael.name)                      ║${NC}"
+    echo -e "${CYAN}║     GitHub: https://github.com/waelisa                       ║${NC}"
     echo -e "${CYAN}╠══════════════════════════════════════════════════════════════╣${NC}"
-    echo -e "${CYAN}║${NC} 1. Quick System Info                                          ${CYAN}║${NC}"
-    echo -e "${CYAN}║${NC} 2. Full System Optimization (with dry run)                  ${CYAN}║${NC}"
-    echo -e "${CYAN}║${NC} 3. Create System Snapshot                                    ${CYAN}║${NC}"
-    echo -e "${CYAN}║${NC} 4. Rollback to Snapshot                                      ${CYAN}║${NC}"
-    echo -e "${CYAN}║${NC} 5. Setup Automated Pi-hole Updates                          ${CYAN}║${NC}"
-    echo -e "${CYAN}║${NC} 6. View System Health                                        ${CYAN}║${NC}"
-    echo -e "${CYAN}║${NC} 7. Reinstall Critical Packages                               ${CYAN}║${NC}"
-    echo -e "${CYAN}║${NC} 8. Fix D-Bus Issues                                          ${CYAN}║${NC}"
-    echo -e "${CYAN}║${NC} 9. Cleanup Only (no changes)                                 ${CYAN}║${NC}"
-    echo -e "${CYAN}║${NC} 10. Full Optimization + Pi-hole Reinstall                   ${CYAN}║${NC}"
-    echo -e "${CYAN}║${NC} 0. Exit                                                       ${CYAN}║${NC}"
+    echo -e "${CYAN}║${NC} 1.  Run Full Optimization (with snapshot)                    ${CYAN}║${NC}"
+    echo -e "${CYAN}║${NC} 2.  Dry Run (Preview changes without applying)               ${CYAN}║${NC}"
+    echo -e "${CYAN}║${NC} 3.  Create System Snapshot (manual)                          ${CYAN}║${NC}"
+    echo -e "${CYAN}║${NC} 4.  Rollback System to Snapshot                              ${CYAN}║${NC}"
+    echo -e "${CYAN}║${NC} 5.  Verify/Fix D-Bus Issues                                  ${CYAN}║${NC}"
+    echo -e "${CYAN}║${NC} 6.  Reinstall Raspberry Pi Components                        ${CYAN}║${NC}"
+    echo -e "${CYAN}║${NC} 7.  Verify/Install Critical Packages                         ${CYAN}║${NC}"
+    echo -e "${CYAN}║${NC} 8.  Setup Automated Pi-hole Updates                          ${CYAN}║${NC}"
+    echo -e "${CYAN}║${NC} 9.  Quick System Info                                        ${CYAN}║${NC}"
+    echo -e "${CYAN}║${NC} 10. View System Health                                       ${CYAN}║${NC}"
+    echo -e "${CYAN}║${NC} 11. Cleanup Only (safe mode)                                 ${CYAN}║${NC}"
+    echo -e "${CYAN}║${NC} 12. Cleanup Old Snapshots (save space)                       ${CYAN}║${NC}"
+    echo -e "${CYAN}║${NC} 0.  Exit                                                     ${CYAN}║${NC}"
+    echo -e "${CYAN}╠══════════════════════════════════════════════════════════════╣${NC}"
+    echo -e "${CYAN}║${NC} System: $DETECTED_DISTRO $DETECTED_VERSION"
+    if [ "$IS_RASPBERRY_PI" = true ]; then
+        echo -e "${CYAN}║${NC} Hardware: $RPI_MODEL"
+    fi
+    echo -e "${CYAN}║${NC} Network: $ACTIVE_INTERFACE ($([ "$IS_WIFI_ACTIVE" = true ] && echo "WiFi" || echo "Ethernet"))"
     echo -e "${CYAN}╚══════════════════════════════════════════════════════════════╝${NC}"
     echo ""
-    read -p "Enter your choice [0-10]: " MENU_CHOICE
+    read -p "Enter your choice [0-12]: " MENU_CHOICE
 }
 
 # ============== MAIN EXECUTION ==============
@@ -649,7 +1213,7 @@ main() {
 
     echo -e "${CYAN}"
     echo "╔══════════════════════════════════════════════════════════════╗"
-    echo "║     Pi-hole Debian 12 Ultra Script v${SCRIPT_VERSION}                ║"
+    echo "║     Pi-hole Debian Ultra Script v${SCRIPT_VERSION}                    ║"
     echo "║     by Wael Isa (https://www.wael.name)                      ║"
     echo "║     GitHub: https://github.com/waelisa                       ║"
     echo "║           Starting Pre-Flight Checks...                      ║"
@@ -666,16 +1230,19 @@ main() {
     verify_dbus
     mkdir -p "$BACKUP_DIR"
 
+    # Show info screen on first run
+    show_script_info
+
     while true; do
         show_menu
 
         case $MENU_CHOICE in
             1)
-                quick_system_info
+                run_full_optimization
                 read -p "Press Enter to continue..."
                 ;;
             2)
-                run_full_optimization
+                dry_run_optimization
                 read -p "Press Enter to continue..."
                 ;;
             3)
@@ -687,11 +1254,11 @@ main() {
                 read -p "Press Enter to continue..."
                 ;;
             5)
-                setup_pihole_updates
+                fix_dbus
                 read -p "Press Enter to continue..."
                 ;;
             6)
-                view_system_health
+                reinstall_rpi_components
                 read -p "Press Enter to continue..."
                 ;;
             7)
@@ -699,23 +1266,30 @@ main() {
                 read -p "Press Enter to continue..."
                 ;;
             8)
-                fix_dbus
+                setup_pihole_updates
                 read -p "Press Enter to continue..."
                 ;;
             9)
-                cleanup_only
+                quick_system_info
                 read -p "Press Enter to continue..."
                 ;;
             10)
-                echo -e "\n${BLUE}Starting Full Optimization + Pi-hole Reinstall${NC}"
-                run_full_optimization
-                reinstall_pihole_optional
+                view_system_health
+                read -p "Press Enter to continue..."
+                ;;
+            11)
+                cleanup_only
+                read -p "Press Enter to continue..."
+                ;;
+            12)
+                cleanup_snapshots
                 read -p "Press Enter to continue..."
                 ;;
             0)
                 echo -e "\n${GREEN}══════════════════════════════════════════════════════════════${NC}"
-                echo -e "${GREEN}Thank you for using Pi-hole Ultra Script!${NC}"
+                echo -e "${GREEN}Thank you for using Pi-hole Debian Ultra Script!${NC}"
                 echo -e "${GREEN}Created by Wael Isa - https://www.wael.name${NC}"
+                echo -e "${GREEN}GitHub: https://github.com/waelisa/Raspberry-Pi-Pi-hole-Debian-Ultra-Script${NC}"
                 echo -e "${GREEN}Log file saved to: $LOG_FILE${NC}"
                 echo -e "\n${YELLOW}If this script helped you, star it on GitHub:${NC}"
                 echo -e "${YELLOW}https://github.com/waelisa/Raspberry-Pi-Pi-hole-Debian-Ultra-Script${NC}"
