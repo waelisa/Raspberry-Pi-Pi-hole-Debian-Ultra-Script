@@ -5,7 +5,7 @@
 # Author:  Wael Isa
 # Website: https://www.wael.name
 # GitHub:  https://github.com/waelisa/Raspberry-Pi-Pi-hole-Debian-Ultra-Script
-# Version: 2.1.7
+# Version: 2.1.8
 # License: MIT
 #
 # Description: Complete system optimization script for systems running
@@ -21,12 +21,13 @@
 # ============== CONFIGURATION ==============
 LOG_FILE="/var/log/pihole-ultra.log"
 BACKUP_DIR="/root/pihole-system-backups"
-SCRIPT_VERSION="2.1.7"
+SCRIPT_VERSION="2.1.8"
 MIN_DISK_SPACE_MB=500  # Minimum 500MB free space required
 MIN_MEMORY_MB=256      # Minimum 256MB free memory recommended
 SNAPSHOT_RETENTION_DAYS=14  # Automatically remove snapshots older than this
 REBOOT_TIMEOUT=60  # Seconds to wait for reboot confirmation before auto-reboot
 DRY_RUN=false
+DRY_RUN_LOG="/tmp/pihole-dryrun-$(date +%Y%m%d-%H%M%S).txt"
 exec > >(tee -a "$LOG_FILE") 2>&1
 
 # ============== COLOR CODES FOR MENU ==============
@@ -94,11 +95,12 @@ show_script_info() {
     echo -e "${CYAN}║${NC} 9. Raspberry Pi specific optimizations (if detected)          ${CYAN}║${NC}"
     echo -e "${CYAN}║${NC}10. Auto-reboot after ${REBOOT_TIMEOUT} seconds if no response             ${CYAN}║${NC}"
     echo -e "${CYAN}║${NC}11. Smart boot config detection (finds active config)          ${CYAN}║${NC}"
+    echo -e "${CYAN}║${NC}12. Dry Run log export (saves changes to /tmp)                 ${CYAN}║${NC}"
     echo -e "${CYAN}╠══════════════════════════════════════════════════════════════╣${NC}"
     echo -e "${CYAN}║${NC} SAFETY FEATURES:                                               ${CYAN}║${NC}"
     echo -e "${CYAN}║${NC} • Full system snapshots before optimization                   ${CYAN}║${NC}"
     echo -e "${CYAN}║${NC} • Rollback capability to restore previous state               ${CYAN}║${NC}"
-    echo -e "${CYAN}║${NC} • Dry-run mode to preview changes without applying            ${CYAN}║${NC}"
+    echo -e "${CYAN}║${NC} • Dry-run mode with log export to review changes              ${CYAN}║${NC}"
     echo -e "${CYAN}║${NC} • Network connectivity checks before disabling services       ${CYAN}║${NC}"
     echo -e "${CYAN}║${NC} • Process checking before cleaning /tmp                       ${CYAN}║${NC}"
     echo -e "${CYAN}║${NC} • Smart boot config detection (finds active config)           ${CYAN}║${NC}"
@@ -118,6 +120,7 @@ show_script_info() {
     echo -e "  • Manual snapshots (Option 3)"
     echo -e "  • Rollback capability (Option 4)"
     echo -e "  • Complete logs at: $LOG_FILE"
+    echo -e "  • Dry Run logs at: /tmp/pihole-dryrun-*.txt"
     echo ""
     read -p "Press Enter to continue to the main menu..."
 }
@@ -1178,33 +1181,48 @@ cleanup_snapshots() {
     esac
 }
 
-# Dry Run Mode - Show what would be removed without actually removing
+# ENHANCED: Dry Run Mode with Log Export
 dry_run_optimization() {
     echo -e "\n${BLUE}=== DRY RUN MODE - Optimization Preview ===${NC}"
     echo -e "${YELLOW}This will show what would be removed without making any changes${NC}\n"
+    echo -e "${GREEN}Log file: $DRY_RUN_LOG${NC}\n"
+
+    # Initialize log file
+    echo "Pi-hole Ultra Script - Dry Run Report" > "$DRY_RUN_LOG"
+    echo "Generated: $(date)" >> "$DRY_RUN_LOG"
+    echo "System: $DETECTED_DISTRO $DETECTED_VERSION" >> "$DRY_RUN_LOG"
+    echo "================================================" >> "$DRY_RUN_LOG"
+    echo "" >> "$DRY_RUN_LOG"
 
     # Check if Pi-hole is installed
     if ! command -v pihole &> /dev/null; then
         echo -e "${RED}❌ Pi-hole is not installed. Please install Pi-hole first.${NC}"
+        echo "❌ Pi-hole is not installed. Please install Pi-hole first." >> "$DRY_RUN_LOG"
         return 1
     fi
 
     # Show orphaned packages that would be removed
     echo -e "${PURPLE}Packages that would be removed (orphaned):${NC}"
+    echo "Packages that would be removed (orphaned):" >> "$DRY_RUN_LOG"
     local orphans=$(deborphan)
     local orphan_count=0
     if [ -n "$orphans" ]; then
         echo "$orphans" | while read pkg; do
             echo -e "  ${YELLOW}→ $pkg${NC}"
+            echo "  → $pkg" >> "$DRY_RUN_LOG"
             orphan_count=$((orphan_count + 1))
         done
     else
         echo -e "  ${GREEN}None found${NC}"
+        echo "  None found" >> "$DRY_RUN_LOG"
     fi
     echo -e "${GREEN}Total orphaned packages: $orphan_count${NC}\n"
+    echo "Total orphaned packages: $orphan_count" >> "$DRY_RUN_LOG"
+    echo "" >> "$DRY_RUN_LOG"
 
     # Show services that would be disabled (non-essential)
     echo -e "${PURPLE}Services that would be analyzed for disabling:${NC}"
+    echo "Services that would be analyzed for disabling:" >> "$DRY_RUN_LOG"
     local services_to_check=(
         "bluetooth"
         "hciuart"
@@ -1219,19 +1237,27 @@ dry_run_optimization() {
     for service in "${services_to_check[@]}"; do
         if systemctl is-enabled "$service" 2>/dev/null | grep -q "enabled"; then
             echo -e "  ${YELLOW}→ $service (currently enabled)${NC}"
+            echo "  → $service (currently enabled)" >> "$DRY_RUN_LOG"
         fi
     done
+    echo "" >> "$DRY_RUN_LOG"
 
     # WiFi disabling warning if applicable
     if [ "$IS_WIFI_ACTIVE" = true ]; then
         echo -e "\n${RED}⚠️  WARNING: You are connected via WiFi!${NC}"
         echo -e "${YELLOW}   The optimization would normally disable WiFi, which would${NC}"
         echo -e "${YELLOW}   disconnect this session. You will be prompted about this.${NC}"
+        echo "" >> "$DRY_RUN_LOG"
+        echo "⚠️  WARNING: You are connected via WiFi!" >> "$DRY_RUN_LOG"
+        echo "   The optimization would normally disable WiFi, which would" >> "$DRY_RUN_LOG"
+        echo "   disconnect this session. You will be prompted about this." >> "$DRY_RUN_LOG"
+        echo "" >> "$DRY_RUN_LOG"
     fi
 
     # Show packages that would be installed (Raspberry Pi specific)
     if [ "$IS_RASPBERRY_PI" = true ]; then
         echo -e "\n${PURPLE}Raspberry Pi packages that would be verified/installed:${NC}"
+        echo "Raspberry Pi packages that would be verified/installed:" >> "$DRY_RUN_LOG"
         local rpi_pkgs=(
             "raspberrypi-kernel"
             "raspberrypi-bootloader"
@@ -1241,29 +1267,54 @@ dry_run_optimization() {
         for pkg in "${rpi_pkgs[@]}"; do
             if ! dpkg -l | grep -q "^ii.*$pkg"; then
                 echo -e "  ${YELLOW}→ $pkg (would be installed)${NC}"
+                echo "  → $pkg (would be installed)" >> "$DRY_RUN_LOG"
             fi
         done
+        echo "" >> "$DRY_RUN_LOG"
     fi
 
     # Show systemd journal cleanup
     echo -e "\n${PURPLE}System logs that would be cleaned:${NC}"
+    echo "System logs that would be cleaned:" >> "$DRY_RUN_LOG"
     local journal_size=$(journalctl --disk-usage 2>/dev/null | awk '{print $3 $4}' || echo "unknown")
     echo -e "  ${YELLOW}→ Journal current size: $journal_size (would be reduced to 100MB)${NC}"
+    echo "  → Journal current size: $journal_size (would be reduced to 100MB)" >> "$DRY_RUN_LOG"
 
     # Show cache cleanup with process warning
     echo -e "\n${PURPLE}Caches that would be cleaned:${NC}"
+    echo "Caches that would be cleaned:" >> "$DRY_RUN_LOG"
     echo -e "  ${YELLOW}→ APT cache (apt clean)${NC}"
+    echo "  → APT cache (apt clean)" >> "$DRY_RUN_LOG"
 
     # Check processes using /tmp
     local tmp_processes=$(lsof /tmp 2>/dev/null | grep -v "COMMAND" | wc -l)
     if [ "$tmp_processes" -gt 0 ]; then
         echo -e "  ${RED}→ /tmp directory (WARNING: $tmp_processes processes using /tmp)${NC}"
+        echo "  → /tmp directory (WARNING: $tmp_processes processes using /tmp)" >> "$DRY_RUN_LOG"
+
+        # List the processes
+        echo -e "\n${YELLOW}Processes using /tmp:${NC}" >> "$DRY_RUN_LOG"
+        lsof /tmp 2>/dev/null | head -20 >> "$DRY_RUN_LOG"
     else
         echo -e "  ${YELLOW}→ /tmp directory${NC}"
+        echo "  → /tmp directory" >> "$DRY_RUN_LOG"
     fi
     echo -e "  ${YELLOW}→ /var/tmp directory${NC}"
+    echo "  → /var/tmp directory" >> "$DRY_RUN_LOG"
 
     echo -e "\n${GREEN}✅ Dry run completed - no changes were made${NC}"
+    echo -e "${GREEN}📄 Detailed report saved to: $DRY_RUN_LOG${NC}"
+    echo "" >> "$DRY_RUN_LOG"
+    echo "================================================" >> "$DRY_RUN_LOG"
+    echo "Dry run completed - no changes were made" >> "$DRY_RUN_LOG"
+
+    # Offer to view the log
+    echo ""
+    read -p "Do you want to view the full report now? (y/N): " -n 1 -r
+    echo
+    if [[ $REPLY =~ ^[Yy]$ ]]; then
+        less "$DRY_RUN_LOG"
+    fi
 }
 
 # Reinstall Raspberry Pi specific components
@@ -1600,7 +1651,7 @@ show_menu() {
     echo -e "${CYAN}║                         MAIN MENU                            ║${NC}"
     echo -e "${CYAN}╠══════════════════════════════════════════════════════════════╣${NC}"
     echo -e "${CYAN}║${NC} 1.  Run Full Optimization (with auto-cleanup)               ${CYAN}║${NC}"
-    echo -e "${CYAN}║${NC} 2.  Dry Run (Preview changes without applying)               ${CYAN}║${NC}"
+    echo -e "${CYAN}║${NC} 2.  Dry Run (Preview with log export)                        ${CYAN}║${NC}"
     echo -e "${CYAN}║${NC} 3.  Create System Snapshot (manual)                          ${CYAN}║${NC}"
     echo -e "${CYAN}║${NC} 4.  Rollback System to Snapshot                              ${CYAN}║${NC}"
     echo -e "${CYAN}║${NC} 5.  Verify/Fix D-Bus Issues                                  ${CYAN}║${NC}"
@@ -1715,11 +1766,13 @@ main() {
                 echo -e "${GREEN}Created by Wael Isa - https://www.wael.name${NC}"
                 echo -e "${GREEN}GitHub: https://github.com/waelisa/Raspberry-Pi-Pi-hole-Debian-Ultra-Script${NC}"
                 echo -e "${GREEN}Log file saved to: $LOG_FILE${NC}"
+                echo -e "${GREEN}Dry Run logs saved to: /tmp/pihole-dryrun-*.txt${NC}"
                 echo -e "\n${YELLOW}If this script helped you, star it on GitHub:${NC}"
                 echo -e "${YELLOW}https://github.com/waelisa/Raspberry-Pi-Pi-hole-Debian-Ultra-Script${NC}"
                 echo -e "\n${CYAN}══════════════════════════════════════════════════════════════${NC}"
                 echo -e "${CYAN}  \"A stable Pi-hole keeps the internet peaceful!\"${NC}"
                 echo -e "${CYAN}  \"Smart boot config detection for perfect compatibility!\"${NC}"
+                echo -e "${CYAN}  \"Dry Run logs let you review before committing!\"${NC}"
                 echo -e "${CYAN}══════════════════════════════════════════════════════════════${NC}"
 
                 # Clean up temp files
