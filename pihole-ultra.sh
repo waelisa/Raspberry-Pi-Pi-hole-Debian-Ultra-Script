@@ -5,7 +5,7 @@
 # Author:  Wael Isa
 # Website: https://www.wael.name
 # GitHub:  https://github.com/waelisa/Raspberry-Pi-Pi-hole-Debian-Ultra-Script
-# Version: 2.1.3
+# Version: 2.1.4
 # License: MIT
 #
 # Description: Complete system optimization script for systems running
@@ -19,9 +19,11 @@
 # ============== CONFIGURATION ==============
 LOG_FILE="/var/log/pihole-ultra.log"
 BACKUP_DIR="/root/pihole-system-backups"
-SCRIPT_VERSION="2.1.3"
+SCRIPT_VERSION="2.1.4"
 MIN_DISK_SPACE_MB=500  # Minimum 500MB free space required
 MIN_MEMORY_MB=256      # Minimum 256MB free memory recommended
+SNAPSHOT_RETENTION_DAYS=14  # Automatically remove snapshots older than this
+REBOOT_TIMEOUT=60  # Seconds to wait for reboot confirmation before auto-reboot
 DRY_RUN=false
 exec > >(tee -a "$LOG_FILE") 2>&1
 
@@ -44,6 +46,9 @@ IS_RASPBERRY_PI=false
 RPI_MODEL=""
 ACTIVE_INTERFACE=""
 IS_WIFI_ACTIVE=false
+OPTIMIZATION_STATS_FILE="/tmp/pihole-ultra-stats.$$"
+START_TIME=$(date +%s)
+START_DISK_USED=$(df / | awk 'NR==2 {print $3}')
 
 # ============== INITIAL CHECKS ==============
 check_root() {
@@ -62,13 +67,15 @@ show_script_info() {
     echo -e "${CYAN}║${NC} This script optimizes your Debian system with Pi-hole by:    ${CYAN}║${NC}"
     echo -e "${CYAN}║${NC}                                                                  ${CYAN}║${NC}"
     echo -e "${CYAN}║${NC} 1. Creating system snapshots (backup) before any changes     ${CYAN}║${NC}"
-    echo -e "${CYAN}║${NC} 2. Removing unnecessary packages (orphaned)                  ${CYAN}║${NC}"
-    echo -e "${CYAN}║${NC} 3. Disabling non-essential services                           ${CYAN}║${NC}"
-    echo -e "${CYAN}║${NC} 4. Optimizing system for Pi-hole performance                  ${CYAN}${NC}"
-    echo -e "${CYAN}║${NC} 5. Cleaning temporary files and logs                           ${CYAN}║${NC}"
-    echo -e "${CYAN}║${NC} 6. Setting up automated Pi-hole updates                       ${CYAN}║${NC}"
-    echo -e "${CYAN}║${NC} 7. Fixing common issues (D-Bus, services)                     ${CYAN}║${NC}"
-    echo -e "${CYAN}║${NC} 8. Raspberry Pi specific optimizations (if detected)          ${CYAN}║${NC}"
+    echo -e "${CYAN}║${NC} 2. Auto-cleaning snapshots older than ${SNAPSHOT_RETENTION_DAYS} days          ${CYAN}║${NC}"
+    echo -e "${CYAN}║${NC} 3. Removing unnecessary packages (orphaned)                  ${CYAN}║${NC}"
+    echo -e "${CYAN}║${NC} 4. Disabling non-essential services                           ${CYAN}║${NC}"
+    echo -e "${CYAN}║${NC} 5. Optimizing system for Pi-hole performance                  ${CYAN}║${NC}"
+    echo -e "${CYAN}║${NC} 6. Cleaning temporary files and logs                           ${CYAN}║${NC}"
+    echo -e "${CYAN}║${NC} 7. Setting up automated Pi-hole updates                       ${CYAN}║${NC}"
+    echo -e "${CYAN}║${NC} 8. Fixing common issues (D-Bus, services)                     ${CYAN}║${NC}"
+    echo -e "${CYAN}║${NC} 9. Raspberry Pi specific optimizations (if detected)          ${CYAN}║${NC}"
+    echo -e "${CYAN}║${NC}10. Auto-reboot after ${REBOOT_TIMEOUT} seconds if no response             ${CYAN}║${NC}"
     echo -e "${CYAN}╠══════════════════════════════════════════════════════════════╣${NC}"
     echo -e "${CYAN}║${NC} SAFETY FEATURES:                                               ${CYAN}║${NC}"
     echo -e "${CYAN}║${NC} • Full system snapshots before optimization                   ${CYAN}║${NC}"
@@ -76,6 +83,7 @@ show_script_info() {
     echo -e "${CYAN}║${NC} • Dry-run mode to preview changes without applying            ${CYAN}║${NC}"
     echo -e "${CYAN}║${NC} • Network connectivity checks before disabling services       ${CYAN}║${NC}"
     echo -e "${CYAN}║${NC} • Confirmation prompts for critical operations                ${CYAN}║${NC}"
+    echo -e "${CYAN}║${NC} • Automatic snapshot cleanup to prevent disk filling          ${CYAN}║${NC}"
     echo -e "${CYAN}╚══════════════════════════════════════════════════════════════╝${NC}"
     echo ""
     read -p "Press Enter to continue to the main menu..."
@@ -258,7 +266,7 @@ install_required_tools() {
         echo -e "${GREEN}✅ dselect already installed${NC}"
     fi
 
-    local tools=("curl" "wget" "git" "dnsutils" "numfmt" "lsb-release" "deborphan" "rfkill" "ethtool")
+    local tools=("curl" "wget" "git" "dnsutils" "numfmt" "lsb-release" "deborphan" "rfkill" "ethtool" "bc")
     for tool in "${tools[@]}"; do
         if ! command -v "$tool" &> /dev/null && ! dpkg -l | grep -q "ii  $tool "; then
             echo -e "${YELLOW}Installing $tool...${NC}"
@@ -421,6 +429,31 @@ create_snapshot() {
     echo -e "${GREEN}   Size: $(du -sh "$snapshot_dir" | cut -f1)${NC}"
 
     CURRENT_BACKUP="$snapshot_name"
+}
+
+# Auto-clean old snapshots (older than SNAPSHOT_RETENTION_DAYS)
+auto_cleanup_snapshots() {
+    echo -e "\n${BLUE}=== Auto-Cleaning Old Snapshots ===${NC}"
+
+    if [ ! -d "$BACKUP_DIR" ]; then
+        echo -e "${YELLOW}No snapshots directory found.${NC}"
+        return
+    fi
+
+    local old_snapshots=$(find "$BACKUP_DIR" -type d -name "pre-optimization-*" -mtime +${SNAPSHOT_RETENTION_DAYS} 2>/dev/null)
+    local old_count=$(echo "$old_snapshots" | grep -v "^$" | wc -l)
+
+    if [ "$old_count" -gt 0 ]; then
+        echo -e "${YELLOW}Found $old_count snapshot(s) older than $SNAPSHOT_RETENTION_DAYS days${NC}"
+        echo "$old_snapshots" | while read snapshot; do
+            local size=$(du -sh "$snapshot" 2>/dev/null | cut -f1)
+            echo -e "  ${YELLOW}→ Removing: $(basename "$snapshot") (${size})${NC}"
+            rm -rf "$snapshot"
+        done
+        echo -e "${GREEN}✅ Old snapshots cleaned up${NC}"
+    else
+        echo -e "${GREEN}✅ No snapshots older than $SNAPSHOT_RETENTION_DAYS days found${NC}"
+    fi
 }
 
 # Rollback function
@@ -774,7 +807,7 @@ verify_packages() {
     fi
 }
 
-# NEW: Clean up old snapshots to save space
+# Clean up old snapshots (manual)
 cleanup_snapshots() {
     echo -e "\n${BLUE}=== Snapshot Cleanup ===${NC}"
 
@@ -991,17 +1024,47 @@ reinstall_rpi_components() {
     fi
 }
 
+# Display optimization summary
+show_optimization_summary() {
+    local end_time=$(date +%s)
+    local duration=$((end_time - START_TIME))
+    local minutes=$((duration / 60))
+    local seconds=$((duration % 60))
+
+    local end_disk_used=$(df / | awk 'NR==2 {print $3}')
+    local disk_saved=$((START_DISK_USED - end_disk_used))
+    local disk_saved_mb=$((disk_saved / 1024))
+
+    local disabled_count=$(grep -c "Disabled" "$OPTIMIZATION_STATS_FILE" 2>/dev/null || echo "0")
+    local removed_count=$(grep -c "Removed" "$OPTIMIZATION_STATS_FILE" 2>/dev/null || echo "0")
+
+    echo -e "\n${GREEN}══════════════════════ OPTIMIZATION SUMMARY ══════════════════════${NC}"
+    echo -e "${GREEN}✅ Time elapsed:${NC} ${minutes}m ${seconds}s"
+    echo -e "${GREEN}✅ Disk space saved:${NC} $(numfmt --to=iec ${disk_saved}K) ($disk_saved_mb MB)"
+    echo -e "${GREEN}✅ Services disabled:${NC} $disabled_count"
+    echo -e "${GREEN}✅ Packages removed:${NC} $removed_count"
+
+    if command -v pihole &> /dev/null; then
+        local pihole_version=$(pihole -v | grep "Pi-hole" | head -1)
+        echo -e "${GREEN}✅ Pi-hole version:${NC} $pihole_version"
+    fi
+
+    echo -e "${GREEN}═══════════════════════════════════════════════════════════════════${NC}"
+}
+
 # Full Optimization with Bloat Removal
 run_full_optimization() {
     echo -e "\n${BLUE}=== Starting Full System Optimization ===${NC}"
     echo -e "${YELLOW}This process will:${NC}"
-    echo -e "  1. Create a system snapshot (backup)"
-    echo -e "  2. Remove orphaned packages (with confirmation)"
-    echo -e "  3. Disable unnecessary services"
-    echo -e "  4. Apply system optimizations"
-    echo -e "  5. Clean temporary files and logs"
-    echo -e "  6. Update system packages"
-    echo -e "  7. Optimize Pi-hole"
+    echo -e "  1. Auto-clean snapshots older than $SNAPSHOT_RETENTION_DAYS days"
+    echo -e "  2. Create a system snapshot (backup)"
+    echo -e "  3. Remove orphaned packages (with confirmation)"
+    echo -e "  4. Disable unnecessary services"
+    echo -e "  5. Apply system optimizations"
+    echo -e "  6. Clean temporary files and logs"
+    echo -e "  7. Update system packages"
+    echo -e "  8. Optimize Pi-hole"
+    echo -e "  9. Auto-reboot after $REBOOT_TIMEOUT seconds if no response"
     echo ""
 
     read -p "Proceed with full optimization? (y/N): " -n 1 -r
@@ -1011,8 +1074,15 @@ run_full_optimization() {
         return 0
     fi
 
-    # Step 1: Create snapshot
-    echo -e "\n${YELLOW}Step 1: Creating system snapshot...${NC}"
+    # Initialize stats file
+    echo "" > "$OPTIMIZATION_STATS_FILE"
+
+    # Step 1: Auto-clean old snapshots
+    echo -e "\n${YELLOW}Step 1: Auto-cleaning old snapshots...${NC}"
+    auto_cleanup_snapshots
+
+    # Step 2: Create snapshot
+    echo -e "\n${YELLOW}Step 2: Creating system snapshot...${NC}"
     if ! create_snapshot; then
         echo -e "${RED}❌ Failed to create snapshot. Aborting optimization.${NC}"
         return 1
@@ -1024,9 +1094,10 @@ run_full_optimization() {
         return 1
     fi
 
-    # Step 2: Remove orphaned packages with confirmation
-    echo -e "\n${YELLOW}Step 2: Checking for orphaned packages...${NC}"
+    # Step 3: Remove orphaned packages with confirmation
+    echo -e "\n${YELLOW}Step 3: Checking for orphaned packages...${NC}"
     local orphans=$(deborphan)
+    local removed_count=0
     if [ -n "$orphans" ]; then
         echo -e "${PURPLE}The following orphaned packages were found:${NC}"
         echo "$orphans" | while read pkg; do
@@ -1036,7 +1107,9 @@ run_full_optimization() {
         read -p "Remove these orphaned packages? (y/N): " -n 1 -r
         echo
         if [[ $REPLY =~ ^[Yy]$ ]]; then
+            removed_count=$(echo "$orphans" | wc -l)
             echo "$orphans" | xargs apt-get remove --purge -y
+            echo "Removed $removed_count" >> "$OPTIMIZATION_STATS_FILE"
             echo -e "${GREEN}✅ Orphaned packages removed${NC}"
         else
             echo -e "${YELLOW}⚠️  Skipping orphaned package removal${NC}"
@@ -1045,8 +1118,8 @@ run_full_optimization() {
         echo -e "${GREEN}✅ No orphaned packages found${NC}"
     fi
 
-    # Step 3: Disable unnecessary services
-    echo -e "\n${YELLOW}Step 3: Disabling unnecessary services...${NC}"
+    # Step 4: Disable unnecessary services
+    echo -e "\n${YELLOW}Step 4: Disabling unnecessary services...${NC}"
     local services_to_disable=(
         "bluetooth"
         "hciuart"
@@ -1055,6 +1128,7 @@ run_full_optimization() {
         "console-setup"
         "keyboard-setup"
     )
+    local disabled_count=0
 
     # Check WiFi status before disabling
     if [ "$IS_WIFI_ACTIVE" = true ]; then
@@ -1077,12 +1151,14 @@ run_full_optimization() {
             systemctl stop "$service" 2>/dev/null
             systemctl disable "$service" 2>/dev/null
             echo -e "${GREEN}✅ Disabled $service${NC}"
+            disabled_count=$((disabled_count + 1))
         fi
     done
+    echo "Disabled $disabled_count" >> "$OPTIMIZATION_STATS_FILE"
 
-    # Step 4: Raspberry Pi specific optimizations
+    # Step 5: Raspberry Pi specific optimizations
     if [ "$IS_RASPBERRY_PI" = true ]; then
-        echo -e "\n${YELLOW}Step 4: Applying Raspberry Pi optimizations...${NC}"
+        echo -e "\n${YELLOW}Step 5: Applying Raspberry Pi optimizations...${NC}"
 
         # Optimize boot/config.txt with precise checks
         local config_path=$(get_config_path)
@@ -1132,8 +1208,8 @@ run_full_optimization() {
         fi
     fi
 
-    # Step 5: Cleaning system
-    echo -e "\n${YELLOW}Step 5: Cleaning system...${NC}"
+    # Step 6: Cleaning system
+    echo -e "\n${YELLOW}Step 6: Cleaning system...${NC}"
     apt autoremove --purge -y
     apt autoclean -y
     apt clean
@@ -1142,14 +1218,14 @@ run_full_optimization() {
     rm -rf /var/tmp/*
     echo -e "${GREEN}✅ System cleaned${NC}"
 
-    # Step 6: Update system
-    echo -e "\n${YELLOW}Step 6: Updating system packages...${NC}"
+    # Step 7: Update system
+    echo -e "\n${YELLOW}Step 7: Updating system packages...${NC}"
     apt update
     apt upgrade -y
     echo -e "${GREEN}✅ System updated${NC}"
 
-    # Step 7: Optimize Pi-hole
-    echo -e "\n${YELLOW}Step 7: Optimizing Pi-hole...${NC}"
+    # Step 8: Optimize Pi-hole
+    echo -e "\n${YELLOW}Step 8: Optimizing Pi-hole...${NC}"
     pihole updateGravity
     pihole -up
     echo -e "${GREEN}✅ Pi-hole optimized${NC}"
@@ -1161,18 +1237,28 @@ run_full_optimization() {
         fix_dbus
     fi
 
+    # Show optimization summary
+    show_optimization_summary
+
     echo -e "\n${GREEN}✅ Full optimization completed!${NC}"
     echo -e "${YELLOW}⚠️  A system reboot is recommended to apply all changes${NC}"
 
-    read -p "Reboot now? (y/N): " -n 1 -r
-    echo
-    if [[ $REPLY =~ ^[Yy]$ ]]; then
-        echo "Rebooting in 10 seconds... Press Ctrl+C to cancel"
-        sleep 10
-        reboot
+    # Reboot countdown with timeout
+    echo -e "\n${YELLOW}System will reboot automatically in $REBOOT_TIMEOUT seconds...${NC}"
+    echo -e "${YELLOW}Press any key to cancel reboot${NC}"
+
+    # Use read with timeout
+    if read -t $REBOOT_TIMEOUT -n 1 -s; then
+        echo -e "\n${GREEN}Reboot cancelled. Please reboot manually later: sudo reboot${NC}"
     else
-        echo -e "${YELLOW}Please reboot manually later: sudo reboot${NC}"
+        echo -e "\n${YELLOW}No input received. Rebooting now...${NC}"
+        echo "Rebooting in 5 seconds... Press Ctrl+C to cancel"
+        sleep 5
+        reboot
     fi
+
+    # Clean up temp file
+    rm -f "$OPTIMIZATION_STATS_FILE" 2>/dev/null
 }
 
 # ============== MENU SYSTEM ==============
@@ -1183,7 +1269,7 @@ show_menu() {
     echo -e "${CYAN}║     by Wael Isa (https://www.wael.name)                      ║${NC}"
     echo -e "${CYAN}║     GitHub: https://github.com/waelisa                       ║${NC}"
     echo -e "${CYAN}╠══════════════════════════════════════════════════════════════╣${NC}"
-    echo -e "${CYAN}║${NC} 1.  Run Full Optimization (with snapshot)                    ${CYAN}║${NC}"
+    echo -e "${CYAN}║${NC} 1.  Run Full Optimization (with auto-cleanup)               ${CYAN}║${NC}"
     echo -e "${CYAN}║${NC} 2.  Dry Run (Preview changes without applying)               ${CYAN}║${NC}"
     echo -e "${CYAN}║${NC} 3.  Create System Snapshot (manual)                          ${CYAN}║${NC}"
     echo -e "${CYAN}║${NC} 4.  Rollback System to Snapshot                              ${CYAN}║${NC}"
@@ -1194,7 +1280,7 @@ show_menu() {
     echo -e "${CYAN}║${NC} 9.  Quick System Info                                        ${CYAN}║${NC}"
     echo -e "${CYAN}║${NC} 10. View System Health                                       ${CYAN}║${NC}"
     echo -e "${CYAN}║${NC} 11. Cleanup Only (safe mode)                                 ${CYAN}║${NC}"
-    echo -e "${CYAN}║${NC} 12. Cleanup Old Snapshots (save space)                       ${CYAN}║${NC}"
+    echo -e "${CYAN}║${NC} 12. Cleanup Old Snapshots (manual)                           ${CYAN}║${NC}"
     echo -e "${CYAN}║${NC} 0.  Exit                                                     ${CYAN}║${NC}"
     echo -e "${CYAN}╠══════════════════════════════════════════════════════════════╣${NC}"
     echo -e "${CYAN}║${NC} System: $DETECTED_DISTRO $DETECTED_VERSION"
@@ -1202,6 +1288,7 @@ show_menu() {
         echo -e "${CYAN}║${NC} Hardware: $RPI_MODEL"
     fi
     echo -e "${CYAN}║${NC} Network: $ACTIVE_INTERFACE ($([ "$IS_WIFI_ACTIVE" = true ] && echo "WiFi" || echo "Ethernet"))"
+    echo -e "${CYAN}║${NC} Auto-cleanup: Snapshots > ${SNAPSHOT_RETENTION_DAYS} days | Auto-reboot: ${REBOOT_TIMEOUT}s"
     echo -e "${CYAN}╚══════════════════════════════════════════════════════════════╝${NC}"
     echo ""
     read -p "Enter your choice [0-12]: " MENU_CHOICE
@@ -1295,6 +1382,9 @@ main() {
                 echo -e "${YELLOW}https://github.com/waelisa/Raspberry-Pi-Pi-hole-Debian-Ultra-Script${NC}"
                 echo -e "\n${CYAN}Remember: A stable Pi-hole keeps the internet peaceful!${NC}"
                 echo -e "${GREEN}══════════════════════════════════════════════════════════════${NC}"
+
+                # Clean up temp files
+                rm -f "$OPTIMIZATION_STATS_FILE" 2>/dev/null
                 exit 0
                 ;;
             *)
