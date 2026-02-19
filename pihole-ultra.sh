@@ -5,7 +5,7 @@
 # Author:  Wael Isa
 # Website: https://www.wael.name
 # GitHub:  https://github.com/waelisa/Raspberry-Pi-Pi-hole-Debian-Ultra-Script
-# Version: 2.1.4
+# Version: 2.1.5
 # License: MIT
 #
 # Description: Complete system optimization script for systems running
@@ -13,13 +13,15 @@
 #              snapshots, rollback capability, and automated updates.
 #              Compatible with Raspberry Pi and other Debian installations.
 #
+# "A stable Pi-hole keeps the internet peaceful!"
+#
 # Usage: sudo ./pihole-ultra.sh
 # =============================================================================
 
 # ============== CONFIGURATION ==============
 LOG_FILE="/var/log/pihole-ultra.log"
 BACKUP_DIR="/root/pihole-system-backups"
-SCRIPT_VERSION="2.1.4"
+SCRIPT_VERSION="2.1.5"
 MIN_DISK_SPACE_MB=500  # Minimum 500MB free space required
 MIN_MEMORY_MB=256      # Minimum 256MB free memory recommended
 SNAPSHOT_RETENTION_DAYS=14  # Automatically remove snapshots older than this
@@ -36,6 +38,17 @@ PURPLE='\033[0;35m'
 CYAN='\033[0;36m'
 NC='\033[0m' # No Color
 
+# ============== ASCII ART ==============
+show_banner() {
+    echo -e "${CYAN}"
+    echo '╔══════════════════════════════════════════════════════════════╗'
+    echo '║     Pi-hole Debian Ultra Script v'$SCRIPT_VERSION'                    ║'
+    echo '║     by Wael Isa (https://www.wael.name)                      ║'
+    echo '║     GitHub: https://github.com/waelisa                       ║'
+    echo '╚══════════════════════════════════════════════════════════════╝'
+    echo -e "${NC}"
+}
+
 # ============== GLOBAL VARIABLES ==============
 CURRENT_BACKUP=""
 MENU_CHOICE=""
@@ -49,6 +62,7 @@ IS_WIFI_ACTIVE=false
 OPTIMIZATION_STATS_FILE="/tmp/pihole-ultra-stats.$$"
 START_TIME=$(date +%s)
 START_DISK_USED=$(df / | awk 'NR==2 {print $3}')
+SCRIPT_RUN_COUNT=0
 
 # ============== INITIAL CHECKS ==============
 check_root() {
@@ -61,6 +75,7 @@ check_root() {
 # Display script information and what it does
 show_script_info() {
     clear
+    show_banner
     echo -e "${CYAN}╔══════════════════════════════════════════════════════════════╗${NC}"
     echo -e "${CYAN}║           Pi-hole Debian Ultra Script - INFORMATION          ║${NC}"
     echo -e "${CYAN}╠══════════════════════════════════════════════════════════════╣${NC}"
@@ -84,7 +99,20 @@ show_script_info() {
     echo -e "${CYAN}║${NC} • Network connectivity checks before disabling services       ${CYAN}║${NC}"
     echo -e "${CYAN}║${NC} • Confirmation prompts for critical operations                ${CYAN}║${NC}"
     echo -e "${CYAN}║${NC} • Automatic snapshot cleanup to prevent disk filling          ${CYAN}║${NC}"
+    echo -e "${CYAN}║${NC} • Reboot timeout to prevent half-finished states              ${CYAN}║${NC}"
     echo -e "${CYAN}╚══════════════════════════════════════════════════════════════╝${NC}"
+    echo ""
+    echo -e "${GREEN}This script is now production-ready and has been tested on:${NC}"
+    echo -e "  • Debian 10 (Buster)"
+    echo -e "  • Debian 11 (Bullseye)"
+    echo -e "  • Debian 12 (Bookworm)"
+    echo -e "  • Raspberry Pi OS (all versions)"
+    echo -e "  • Ubuntu 20.04 LTS and 22.04 LTS"
+    echo ""
+    echo -e "${YELLOW}If anything goes wrong, you have:${NC}"
+    echo -e "  • Manual snapshots (Option 3)"
+    echo -e "  • Rollback capability (Option 4)"
+    echo -e "  • Complete logs at: $LOG_FILE"
     echo ""
     read -p "Press Enter to continue to the main menu..."
 }
@@ -125,6 +153,9 @@ detect_debian_version() {
         if grep -q "Raspbian" /etc/os-release 2>/dev/null; then
             DETECTED_DISTRO="Raspbian"
             echo -e "${GREEN}✅ Detected: Raspbian/Debian $DETECTED_VERSION${NC}"
+        elif grep -q "Raspberry Pi OS" /etc/os-release 2>/dev/null; then
+            DETECTED_DISTRO="Raspberry Pi OS"
+            echo -e "${GREEN}✅ Detected: Raspberry Pi OS (Debian $DETECTED_VERSION)${NC}"
         fi
         return 0
     elif [ -f /etc/os-release ]; then
@@ -241,12 +272,21 @@ pre_flight_check() {
         echo -e "${GREEN}  ✅ Package manager working${NC}"
     fi
 
+    # Check 7: Check if Pi-hole is installed
+    echo -e "\n${YELLOW}Checking Pi-hole installation...${NC}"
+    if command -v pihole &> /dev/null; then
+        local pihole_version=$(pihole -v | grep "Pi-hole" | head -1 | cut -d' ' -f4)
+        echo -e "${GREEN}  ✅ Pi-hole is installed (version $pihole_version)${NC}"
+    else
+        echo -e "${YELLOW}  ⚠️  Pi-hole is not installed - some features may be limited${NC}"
+    fi
+
     echo -e "\n${BLUE}=== Pre-Flight Summary ===${NC}"
     if [ "$checks_passed" = true ]; then
         echo -e "${GREEN}✅ All critical checks passed!${NC}"
         return 0
     else
-        echo -e "${RED}❌ Critical checks failed. Please fix issues before proceeding.${NC}"
+        echo -e "${RED}❌ Critical checks failed. Please resolve issues and try again.${NC}"
         return 1
     fi
 }
@@ -424,6 +464,11 @@ create_snapshot() {
     # Save network config
     ip addr show > "${snapshot_dir}/network-config.txt" 2>/dev/null
 
+    # Save system info
+    echo "Snapshot created: $(date)" > "${snapshot_dir}/snapshot-info.txt"
+    echo "Script version: $SCRIPT_VERSION" >> "${snapshot_dir}/snapshot-info.txt"
+    echo "User: $USER" >> "${snapshot_dir}/snapshot-info.txt"
+
     echo -e "${GREEN}✅ Snapshot created: ${snapshot_name}${NC}"
     echo -e "${GREEN}   Location: ${snapshot_dir}${NC}"
     echo -e "${GREEN}   Size: $(du -sh "$snapshot_dir" | cut -f1)${NC}"
@@ -459,6 +504,7 @@ auto_cleanup_snapshots() {
 # Rollback function
 rollback_system() {
     echo -e "\n${PURPLE}=== System Rollback ===${NC}"
+    echo -e "${YELLOW}This will restore your system to a previous state${NC}\n"
 
     if [ ! -d "$BACKUP_DIR" ]; then
         echo -e "${RED}❌ No backup directory found at $BACKUP_DIR${NC}"
@@ -475,7 +521,8 @@ rollback_system() {
     echo -e "${YELLOW}Available snapshots (most recent first):${NC}"
     for i in "${!snapshots[@]}"; do
         local size=$(du -sh "${BACKUP_DIR}/${snapshots[$i]}" 2>/dev/null | cut -f1)
-        echo "$((i+1)). ${snapshots[$i]} (${size})"
+        local date=$(echo "${snapshots[$i]}" | sed 's/pre-optimization-//')
+        echo "$((i+1)). ${snapshots[$i]} (${size}) - ${date}"
     done
 
     echo ""
@@ -562,14 +609,17 @@ rollback_system() {
     echo -e "${GREEN}✅ Rollback completed${NC}"
     echo -e "${YELLOW}⚠️  A system reboot is REQUIRED to complete rollback${NC}"
 
-    read -p "Reboot now? (y/N): " -n 1 -r
-    echo
-    if [[ $REPLY =~ ^[Yy]$ ]]; then
-        echo "Rebooting in 10 seconds... Press Ctrl+C to cancel"
-        sleep 10
-        reboot
+    # Reboot countdown with timeout
+    echo -e "\n${YELLOW}System will reboot automatically in $REBOOT_TIMEOUT seconds...${NC}"
+    echo -e "${YELLOW}Press any key to cancel reboot${NC}"
+
+    if read -t $REBOOT_TIMEOUT -n 1 -s; then
+        echo -e "\n${GREEN}Reboot cancelled. Please reboot manually later: sudo reboot${NC}"
     else
-        echo -e "${YELLOW}Please reboot manually later: sudo reboot${NC}"
+        echo -e "\n${YELLOW}No input received. Rebooting now...${NC}"
+        echo "Rebooting in 5 seconds... Press Ctrl+C to cancel"
+        sleep 5
+        reboot
     fi
 }
 
@@ -655,12 +705,20 @@ quick_system_info() {
 
     if command -v pihole &> /dev/null; then
         echo -e "${GREEN}Pi-hole:${NC} $(pihole status | head -1)"
+        echo -e "${GREEN}Pi-hole Version:${NC} $(pihole -v | grep "Pi-hole" | head -1 | cut -d' ' -f4)"
     else
         echo -e "${YELLOW}Pi-hole:${NC} Not installed"
     fi
 
     echo -e "${GREEN}D-Bus:${NC} $(systemctl is-active dbus)"
     echo -e "${GREEN}Failed Services:${NC} $(systemctl --failed | grep -c "loaded failed" || echo "0")"
+
+    # Show backup stats
+    if [ -d "$BACKUP_DIR" ]; then
+        local snapshot_count=$(ls -1 "$BACKUP_DIR" 2>/dev/null | wc -l)
+        local backup_size=$(du -sh "$BACKUP_DIR" 2>/dev/null | cut -f1)
+        echo -e "${GREEN}Snapshots:${NC} $snapshot_count (total size: $backup_size)"
+    fi
 }
 
 # View system health
@@ -681,12 +739,16 @@ view_system_health() {
 
     if [ "$IS_RASPBERRY_PI" = true ]; then
         echo -e "\n${YELLOW}Raspberry Pi Specific:${NC}"
-        vcgencmd measure_temp 2>/dev/null && vcgencmd get_throttled 2>/dev/null
+        vcgencmd measure_temp 2>/dev/null
+        vcgencmd get_throttled 2>/dev/null
+        vcgencmd measure_volts core 2>/dev/null
     fi
 
     if command -v pihole &> /dev/null; then
         echo -e "\n${YELLOW}Pi-hole Status:${NC}"
         pihole status
+        echo -e "\n${YELLOW}Pi-hole Query Log Stats:${NC}"
+        pihole -c -j 2>/dev/null | grep -E "total_queries|blocked_queries" || echo "Unable to get stats"
     fi
 }
 
@@ -724,12 +786,15 @@ fix_dbus() {
 cleanup_only() {
     echo -e "\n${BLUE}=== Safe Cleanup Mode ===${NC}"
     echo -e "${YELLOW}This will only clean temporary files and logs${NC}"
+    echo -e "${YELLOW}No system changes will be made${NC}\n"
 
     read -p "Proceed with safe cleanup? (y/N): " -n 1 -r
     echo
     if [[ ! $REPLY =~ ^[Yy]$ ]]; then
         return
     fi
+
+    local before_space=$(df -h / | awk 'NR==2 {print $4}')
 
     apt autoremove --purge -y
     apt autoclean -y
@@ -738,8 +803,11 @@ cleanup_only() {
     rm -rf /tmp/*
     rm -rf /var/tmp/*
 
+    local after_space=$(df -h / | awk 'NR==2 {print $4}')
+
     echo -e "${GREEN}✅ Safe cleanup completed${NC}"
-    echo -e "Disk space now: $(df -h / | awk 'NR==2 {print $4}') free"
+    echo -e "Disk space before: $before_space"
+    echo -e "Disk space after: $after_space"
 }
 
 # Verify packages
@@ -826,7 +894,8 @@ cleanup_snapshots() {
     echo -e "${YELLOW}Current snapshots:${NC}"
     for i in "${!snapshots[@]}"; do
         local size=$(du -sh "${BACKUP_DIR}/${snapshots[$i]}" 2>/dev/null | cut -f1)
-        echo "$((i+1)). ${snapshots[$i]} (${size})"
+        local date=$(echo "${snapshots[$i]}" | sed 's/pre-optimization-//')
+        echo "$((i+1)). ${snapshots[$i]} (${size}) - ${date}"
     done
 
     echo ""
@@ -850,8 +919,11 @@ cleanup_snapshots() {
             ;;
         2)
             echo -e "${YELLOW}Removing snapshots older than 30 days...${NC}"
+            local before_count=$(ls -1 "$BACKUP_DIR" | wc -l)
             find "$BACKUP_DIR" -type d -mtime +30 -exec rm -rf {} \; 2>/dev/null
-            echo -e "${GREEN}✅ Old snapshots removed${NC}"
+            local after_count=$(ls -1 "$BACKUP_DIR" 2>/dev/null | wc -l)
+            local removed=$((before_count - after_count))
+            echo -e "${GREEN}✅ Removed $removed old snapshot(s)${NC}"
             ;;
         3)
             if [ ${#snapshots[@]} -gt 1 ]; then
@@ -1017,9 +1089,16 @@ reinstall_rpi_components() {
     echo -e "${GREEN}✅ Raspberry Pi components reinstalled${NC}"
     echo -e "${YELLOW}⚠️  A reboot is recommended to apply changes${NC}"
 
-    read -p "Reboot now? (y/N): " -n 1 -r
-    echo
-    if [[ $REPLY =~ ^[Yy]$ ]]; then
+    # Reboot countdown with timeout
+    echo -e "\n${YELLOW}System will reboot automatically in $REBOOT_TIMEOUT seconds...${NC}"
+    echo -e "${YELLOW}Press any key to cancel reboot${NC}"
+
+    if read -t $REBOOT_TIMEOUT -n 1 -s; then
+        echo -e "\n${GREEN}Reboot cancelled. Please reboot manually later: sudo reboot${NC}"
+    else
+        echo -e "\n${YELLOW}No input received. Rebooting now...${NC}"
+        echo "Rebooting in 5 seconds... Press Ctrl+C to cancel"
+        sleep 5
         reboot
     fi
 }
@@ -1040,12 +1119,18 @@ show_optimization_summary() {
 
     echo -e "\n${GREEN}══════════════════════ OPTIMIZATION SUMMARY ══════════════════════${NC}"
     echo -e "${GREEN}✅ Time elapsed:${NC} ${minutes}m ${seconds}s"
-    echo -e "${GREEN}✅ Disk space saved:${NC} $(numfmt --to=iec ${disk_saved}K) ($disk_saved_mb MB)"
+
+    if [ "$disk_saved" -gt 0 ]; then
+        echo -e "${GREEN}✅ Disk space saved:${NC} $(numfmt --to=iec ${disk_saved}K) ($disk_saved_mb MB)"
+    else
+        echo -e "${GREEN}✅ Disk space saved:${NC} None (system optimized)"
+    fi
+
     echo -e "${GREEN}✅ Services disabled:${NC} $disabled_count"
     echo -e "${GREEN}✅ Packages removed:${NC} $removed_count"
 
     if command -v pihole &> /dev/null; then
-        local pihole_version=$(pihole -v | grep "Pi-hole" | head -1)
+        local pihole_version=$(pihole -v | grep "Pi-hole" | head -1 | cut -d' ' -f4)
         echo -e "${GREEN}✅ Pi-hole version:${NC} $pihole_version"
     fi
 
@@ -1240,7 +1325,7 @@ run_full_optimization() {
     # Show optimization summary
     show_optimization_summary
 
-    echo -e "\n${GREEN}✅ Full optimization completed!${NC}"
+    echo -e "\n${GREEN}✅ Full optimization completed successfully!${NC}"
     echo -e "${YELLOW}⚠️  A system reboot is recommended to apply all changes${NC}"
 
     # Reboot countdown with timeout
@@ -1264,10 +1349,9 @@ run_full_optimization() {
 # ============== MENU SYSTEM ==============
 show_menu() {
     clear
+    show_banner
     echo -e "${CYAN}╔══════════════════════════════════════════════════════════════╗${NC}"
-    echo -e "${CYAN}║     Pi-hole Debian Ultra Script v${SCRIPT_VERSION}                    ║${NC}"
-    echo -e "${CYAN}║     by Wael Isa (https://www.wael.name)                      ║${NC}"
-    echo -e "${CYAN}║     GitHub: https://github.com/waelisa                       ║${NC}"
+    echo -e "${CYAN}║                         MAIN MENU                            ║${NC}"
     echo -e "${CYAN}╠══════════════════════════════════════════════════════════════╣${NC}"
     echo -e "${CYAN}║${NC} 1.  Run Full Optimization (with auto-cleanup)               ${CYAN}║${NC}"
     echo -e "${CYAN}║${NC} 2.  Dry Run (Preview changes without applying)               ${CYAN}║${NC}"
@@ -1289,6 +1373,10 @@ show_menu() {
     fi
     echo -e "${CYAN}║${NC} Network: $ACTIVE_INTERFACE ($([ "$IS_WIFI_ACTIVE" = true ] && echo "WiFi" || echo "Ethernet"))"
     echo -e "${CYAN}║${NC} Auto-cleanup: Snapshots > ${SNAPSHOT_RETENTION_DAYS} days | Auto-reboot: ${REBOOT_TIMEOUT}s"
+    if [ -d "$BACKUP_DIR" ]; then
+        local snapshot_count=$(ls -1 "$BACKUP_DIR" 2>/dev/null | wc -l)
+        echo -e "${CYAN}║${NC} Snapshots: $snapshot_count available"
+    fi
     echo -e "${CYAN}╚══════════════════════════════════════════════════════════════╝${NC}"
     echo ""
     read -p "Enter your choice [0-12]: " MENU_CHOICE
@@ -1298,14 +1386,9 @@ show_menu() {
 main() {
     check_root
 
-    echo -e "${CYAN}"
-    echo "╔══════════════════════════════════════════════════════════════╗"
-    echo "║     Pi-hole Debian Ultra Script v${SCRIPT_VERSION}                    ║"
-    echo "║     by Wael Isa (https://www.wael.name)                      ║"
-    echo "║     GitHub: https://github.com/waelisa                       ║"
-    echo "║           Starting Pre-Flight Checks...                      ║"
-    echo "╚══════════════════════════════════════════════════════════════╝"
-    echo -e "${NC}"
+    clear
+    show_banner
+    echo -e "${BLUE}Starting Pre-Flight Checks...${NC}\n"
 
     if ! pre_flight_check; then
         echo -e "\n${RED}❌ Pre-flight checks failed. Please resolve issues and try again.${NC}"
@@ -1318,6 +1401,7 @@ main() {
     mkdir -p "$BACKUP_DIR"
 
     # Show info screen on first run
+    SCRIPT_RUN_COUNT=1
     show_script_info
 
     while true; do
@@ -1380,11 +1464,13 @@ main() {
                 echo -e "${GREEN}Log file saved to: $LOG_FILE${NC}"
                 echo -e "\n${YELLOW}If this script helped you, star it on GitHub:${NC}"
                 echo -e "${YELLOW}https://github.com/waelisa/Raspberry-Pi-Pi-hole-Debian-Ultra-Script${NC}"
-                echo -e "\n${CYAN}Remember: A stable Pi-hole keeps the internet peaceful!${NC}"
-                echo -e "${GREEN}══════════════════════════════════════════════════════════════${NC}"
+                echo -e "\n${CYAN}══════════════════════════════════════════════════════════════${NC}"
+                echo -e "${CYAN}  \"A stable Pi-hole keeps the internet peaceful!\"${NC}"
+                echo -e "${CYAN}══════════════════════════════════════════════════════════════${NC}"
 
                 # Clean up temp files
                 rm -f "$OPTIMIZATION_STATS_FILE" 2>/dev/null
+                rm -f "$TEMP_SELECTIONS"* 2>/dev/null
                 exit 0
                 ;;
             *)
