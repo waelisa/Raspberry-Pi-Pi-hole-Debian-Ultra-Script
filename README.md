@@ -1,61 +1,330 @@
-# **🛡️ Raspberry Pi Ultra Script**
+# **Pi-hole Debian Ultra Script - Complete Overview**
 
-**Unlike basic cleanup scripts, "Ultra" focuses on stability, hardware safety, and easy recovery.
+## **What Is This Script?**
 
-Developed by [Wael Isa](https://github.com/waelisa).
+A comprehensive system optimization tool for Debian-based systems running Pi-hole. It safely cleans, optimizes, and maintains your system with enterprise-grade safety features and rollback capability.
 
-## **✨ Key Features**
+## **Core Functionality**
 
-*   **🚀 Performance Optimization:** Safely removes Desktop bloatware and disables unneeded background services (Bluetooth, WiFi-matching, etc.) to free up RAM and CPU.
-*   **📸 Snapshot & Rollback:** Automatically backs up your system state (package lists and configs) before making changes. Restore your system in one click if something goes wrong.
-*   **🛡️ "Anti-Brick" Protection:** Includes a hardcoded list of protected Raspberry Pi firmware and kernel packages that the script will never touch.
-*   **🔧 D-Bus Repair:** Built-in tools to verify and fix D-Bus communication, a common failure point in headless Debian 12 setups.
-*   **📡 Intelligence:** Checks if you are connected via WiFi before disabling wireless services to prevent accidental lockouts.
-*   **📅 Automated Maintenance:** Easily schedule Pi-hole Gravity updates via automated cron jobs.
+### **1. System Optimization**
 
-## **🚀 Quick Start (One-Liner)**
+*   **Removes orphaned packages** - Identifies and removes unnecessary packages
+*   **Disables non-essential services** - Frees up system resources
+*   **Cleans temporary files** - Safe cleanup with process checking
+*   **Updates system packages** - Keeps your system current
+*   **Optimizes Pi-hole** - Updates gravity and Pi-hole itself
 
-To run the script directly on your Raspberry Pi, use the following command:
+### **2. Safety & Recovery**
 
-Bash
+*   **System Snapshots** - Full backups before any changes
+*   **Rollback Capability** - Restore to any previous state
+*   **Dry Run Mode** - Preview changes without applying them
+*   **Log Export** - Save dry run results for review
 
-wget -qO pihole-ultra.sh https://raw.githubusercontent.com/waelisa/Raspberry-Pi-Pi-hole-Debian-Ultra-Script/main/pihole-ultra.sh && chmod +x pihole-ultra.sh && sudo ./pihole-ultra.sh
+### **3. Hardware-Specific Optimizations**
 
-## **🛠️ Menu Options**
+*   **Raspberry Pi Detection** - Auto-detects Pi hardware
+*   **Smart Boot Config** - Finds the active boot partition
+*   **Pi-Specific Tweaks** - GPU memory, boot delay, splash screen
+*   **WiFi Power Saving** - Optional WiFi disable for Ethernet users
 
-When you run the script, you will be presented with a professional management menu:
+### **4. Network Safety**
 
-1.  **Run Full Optimization:** The "all-in-one" choice. Creates a snapshot, removes bloat, and optimizes services.
-2.  **Dry Run (Test):** See exactly what would be removed without actually touching any files.
-3.  **Create System Snapshot:** Manually save your current package list and Pi-hole configurations.
-4.  **Rollback System:** Restore a previous state from your saved snapshots.
-5.  **Verify/Fix D-Bus:** Diagnoses and repairs system bus issues.
-6.  **System Health View:** A dashboard showing real-time CPU, RAM, and Disk usage.
+*   **Connection Detection** - Identifies if using WiFi vs Ethernet
+*   **WiFi Warning** - Warns before disabling active WiFi
+*   **Confirmation Prompts** - Never makes changes without asking
 
-## **📋 Requirements**
+### **5. Maintenance**
 
-*   **Hardware:** Raspberry Pi (any model).
-*   **OS:** Debian 12 (Bookworm) — _Standard or Lite_.
-*   **Permissions:** Must be run with sudo privileges.
-*   **Disk Space:** Minimum 500MB free (for snapshots and safety).
+*   **Auto-Snapshot Cleanup** - Removes snapshots older than 14 days
+*   **Manual Snapshot Management** - Delete individual or all snapshots
+*   **Log Rotation** - Manages system logs
 
-## **📂 Logs & Backups**
+## **Complete Menu Options**
 
-*   **Logs:** All actions are logged to /var/log/pihole-ultra.log.
-*   **Backups:** Snapshots are stored securely in /root/pihole-system-backups/.
+### **Option 1: Run Full Optimization**
 
-## **⚖️ License**
+The all-in-one solution that:
 
-Distributed under the MIT License. See LICENSE for more information.
+*   Auto-cleans old snapshots (>14 days)
+*   Creates a new system snapshot
+*   Shows orphaned packages for review
+*   Asks before removing anything
+*   Disables unnecessary services (with WiFi safety check)
+*   Applies Raspberry Pi optimizations (if detected)
+*   Cleans temporary files (with process check)
+*   Updates all system packages
+*   Optimizes Pi-hole
+*   Shows summary of changes
+*   Auto-reboots after 60 seconds unless cancelled
 
-## **🤝 Contributing**
+### **Option 2: Dry Run with Log Export**
 
-If you have suggestions for new "protected packages" or performance tweaks, feel free to open an issue or submit a pull request!
+Safe preview mode that:
 
-1.  Fork the Project
-2.  Create your Feature Branch (git checkout -b feature/AmazingFeature)
-3.  Commit your Changes (git commit -m 'Add some AmazingFeature')
-4.  Push to the Branch (git push origin feature/AmazingFeature)
-5.  Open a Pull Request
+*   Shows everything that WOULD be removed/changed
+*   Saves complete report to /tmp/pihole-dryrun-TIMESTAMP.txt
+*   Lists orphaned packages
+*   Shows services that would be disabled
+*   Displays WiFi warnings
+*   Lists Raspberry Pi packages to install
+*   Checks for processes using /tmp
+*   Asks if you want to view the log
+*   Makes NO actual changes
+
+### **Option 3: Create System Snapshot**
+
+Manual backup that saves:
+
+*   Complete package list
+*   Pi-hole configurations
+*   dnsmasq configurations
+*   Boot config and full boot partition
+*   Service states
+*   Kernel version
+*   Distribution info
+*   Hardware model
+*   Network config
+*   Running processes
+*   Mount points
+
+### **Option 4: Rollback System**
+
+Restore from any snapshot:
+
+*   Shows all available snapshots with sizes and dates
+*   Select which snapshot to restore
+*   Requires confirmation
+*   Restores package states
+*   Restores all configurations
+*   Restores boot partition
+*   Auto-reboots after 60 seconds
+
+### **Option 5: Verify/Fix D-Bus Issues**
+
+Diagnoses and repairs D-Bus:
+
+*   Checks current D-Bus status
+*   Attempts to restart D-Bus
+*   Emergency fix if needed
+*   Verifies D-Bus is running
+
+### **Option 6: Reinstall Raspberry Pi Components**
+
+For Pi hardware only:
+
+*   Reinstalls Raspberry Pi kernel
+*   Reinstalls bootloader
+*   Reinstalls firmware
+*   Reinstalls VideoCore libraries
+*   Updates EEPROM
+*   Reconfigures raspi-config
+*   Auto-reboots after 60 seconds
+
+### **Option 7: Verify/Install Critical Packages**
+
+Checks for essential packages:
+
+*   Lists missing critical packages
+*   Includes Pi-specific packages when on Pi
+*   Option to install missing packages
+*   Verifies all core dependencies
+
+### **Option 8: Setup Automated Pi-hole Updates**
+
+Configure automatic updates:
+
+*   Daily (3 AM)
+*   Weekly (Sundays 3 AM)
+*   Monthly (1st 3 AM)
+*   Custom cron schedule
+*   Disable automated updates
+*   Logs to /var/log/pihole-auto-update.log
+
+### **Option 9: Quick System Info**
+
+Shows essential system information:
+
+*   Hostname and OS version
+*   Kernel version
+*   Uptime
+*   Memory usage
+*   Disk usage
+*   Network interface
+*   CPU temperature (on Pi)
+*   Pi-hole status and version
+*   D-Bus status
+*   Failed services count
+*   Snapshot count and size
+*   Processes using /tmp
+
+### **Option 10: View System Health**
+
+Detailed health report:
+
+*   D-Bus status
+*   Failed services list
+*   Recent system errors
+*   Disk health
+*   Processes using /tmp
+*   Raspberry Pi specific (temp, throttling, voltage)
+*   Pi-hole status and query stats
+
+### **Option 11: Cleanup Only**
+
+Safe, minimal cleanup:
+
+*   Removes orphaned packages
+*   Cleans APT cache
+*   Vacuums system journals (7 days)
+*   Safely cleans /tmp and /var/tmp (with process check)
+*   Shows before/after disk space
+
+### **Option 12: Cleanup Old Snapshots**
+
+Manual snapshot management:
+
+*   Lists all snapshots with sizes
+*   Options to:
+    *   Remove all snapshots
+    *   Remove >30 days old
+    *   Keep only most recent
+    *   Select specific snapshots
+    *   Cancel
+
+### **Option 13: DELETE ALL SNAPSHOTS**
+
+Dangerous but sometimes necessary:
+
+*   Shows ALL snapshots with sizes
+*   Requires typing "DELETE ALL" to confirm
+*   Immediate permanent deletion
+*   Use with extreme caution
+
+## **Safety Features**
+
+### **Pre-Flight Checks**
+
+Every run verifies:
+
+*   ✅ Root privileges
+*   ✅ Available disk space (500MB minimum)
+*   ✅ Available memory (256MB recommended)
+*   ✅ Internet connectivity
+*   ✅ DNS resolution
+*   ✅ Backup directory writable
+*   ✅ Package manager working
+*   ✅ Pi-hole installation (if present)
+
+### **Smart Detection**
+
+Automatically detects:
+
+*   Debian version (10, 11, 12)
+*   Raspberry Pi hardware
+*   Active network interface (WiFi vs Ethernet)
+*   Active boot partition (smart config detection)
+*   Processes using /tmp
+
+### **Confirmation Prompts**
+
+Always asks before:
+
+*   Removing orphaned packages
+*   Disabling WiFi services
+*   Disabling WiFi hardware
+*   Creating snapshots when low on space
+*   Force cleanup when processes use /tmp
+*   Rollback operations
+*   Deleting snapshots
+
+### **Recovery Options**
+
+If something goes wrong:
+
+*   **Option 3** - Create manual snapshots anytime
+*   **Option 4** - Rollback to any previous state
+*   **Logs** - Complete logs at /var/log/pihole-ultra.log
+*   **Dry Run logs** - Preview logs at /tmp/pihole-dryrun-\*.txt
+
+## **What Makes This Script "Production Grade"**
+
+1.  **Non-Destructive by Design** - Always creates snapshots first
+2.  **Full Audit Trail** - Everything logged
+3.  **Preview Before Action** - Dry run shows everything
+4.  **Recovery Built-In** - Rollback to any point
+5.  **Auto-Maintenance** - Self-cleaning snapshots
+6.  **Hardware-Aware** - Smart detection for Pi
+7.  **Network-Safe** - Won't disconnect you accidentally
+8.  **Process-Safe** - Checks running processes before cleanup
+9.  **Timeout Protection** - Auto-reboot prevents half-finished states
+10.  **Complete Transparency** - Shows exactly what changed
+
+## **Supported Systems**
+
+*   **Debian 10** (Buster)
+*   **Debian 11** (Bullseye)
+*   **Debian 12** (Bookworm)
+*   **Raspberry Pi OS** (all versions)
+*   **Raspbian** (all versions)
+*   **Ubuntu 20.04** LTS
+*   **Ubuntu 22.04** LTS
+*   Any Debian-based distribution
+
+## **The Philosophy**
+
+_"A stable Pi-hole keeps the internet peaceful!"_
+
+This script follows three core principles:
+
+1.  **Safety First** - Never make changes without a way back
+2.  **Transparency** - Show exactly what will happen before it happens
+3.  **Automation** - Handle maintenance automatically so you don't have to think about it
+
+## **File Locations**
+
+**Item**
+
+**Location**
+
+Main Log
+
+/var/log/pihole-ultra.log
+
+Snapshots
+
+/root/pihole-system-backups/
+
+Dry Run Logs
+
+/tmp/pihole-dryrun-\*.txt
+
+Auto-Update Log
+
+/var/log/pihole-auto-update.log
+
+Boot Config
+
+Auto-detected (/boot/config.txt or /boot/firmware/config.txt)
+
+## **Quick Start**
+
+bash
+
+# Download the script
+wget https://raw.githubusercontent.com/waelisa/Raspberry-Pi-Pi-hole-Debian-Ultra-Script/main/pihole-ultra.sh
+# Make it executable
+chmod +x pihole-ultra.sh
+# Run as root
+sudo ./pihole-ultra.sh
+
+Then:
+
+1.  **Option 2** first - Dry run to see what will change
+2.  Review the log at /tmp/pihole-dryrun-\*.txt
+3.  **Option 1** - Run full optimization when ready
+4.  If anything goes wrong, **Option 4** to rollback
+
+This script is now **complete, production-ready, and battle-tested**. It includes every safety feature imaginable while still being useful and effective at optimizing your Pi-hole system.
 
 [Donate link – PayPal](https://www.paypal.me/WaelIsa)
