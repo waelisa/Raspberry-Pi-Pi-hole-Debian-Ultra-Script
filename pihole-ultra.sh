@@ -5,7 +5,7 @@
 # Author:  Wael Isa
 # Website: https://www.wael.name
 # GitHub:  https://github.com/waelisa/Raspberry-Pi-Pi-hole-Debian-Ultra-Script
-# Version: 2.1.5
+# Version: 2.1.7
 # License: MIT
 #
 # Description: Complete system optimization script for systems running
@@ -21,7 +21,7 @@
 # ============== CONFIGURATION ==============
 LOG_FILE="/var/log/pihole-ultra.log"
 BACKUP_DIR="/root/pihole-system-backups"
-SCRIPT_VERSION="2.1.5"
+SCRIPT_VERSION="2.1.7"
 MIN_DISK_SPACE_MB=500  # Minimum 500MB free space required
 MIN_MEMORY_MB=256      # Minimum 256MB free memory recommended
 SNAPSHOT_RETENTION_DAYS=14  # Automatically remove snapshots older than this
@@ -63,6 +63,8 @@ OPTIMIZATION_STATS_FILE="/tmp/pihole-ultra-stats.$$"
 START_TIME=$(date +%s)
 START_DISK_USED=$(df / | awk 'NR==2 {print $3}')
 SCRIPT_RUN_COUNT=0
+BOOT_CONFIG_PATH=""
+BOOT_PARTITION_MOUNT=""
 
 # ============== INITIAL CHECKS ==============
 check_root() {
@@ -86,17 +88,20 @@ show_script_info() {
     echo -e "${CYAN}║${NC} 3. Removing unnecessary packages (orphaned)                  ${CYAN}║${NC}"
     echo -e "${CYAN}║${NC} 4. Disabling non-essential services                           ${CYAN}║${NC}"
     echo -e "${CYAN}║${NC} 5. Optimizing system for Pi-hole performance                  ${CYAN}║${NC}"
-    echo -e "${CYAN}║${NC} 6. Cleaning temporary files and logs                           ${CYAN}║${NC}"
+    echo -e "${CYAN}║${NC} 6. Cleaning temporary files and logs (with process check)     ${CYAN}║${NC}"
     echo -e "${CYAN}║${NC} 7. Setting up automated Pi-hole updates                       ${CYAN}║${NC}"
     echo -e "${CYAN}║${NC} 8. Fixing common issues (D-Bus, services)                     ${CYAN}║${NC}"
     echo -e "${CYAN}║${NC} 9. Raspberry Pi specific optimizations (if detected)          ${CYAN}║${NC}"
     echo -e "${CYAN}║${NC}10. Auto-reboot after ${REBOOT_TIMEOUT} seconds if no response             ${CYAN}║${NC}"
+    echo -e "${CYAN}║${NC}11. Smart boot config detection (finds active config)          ${CYAN}║${NC}"
     echo -e "${CYAN}╠══════════════════════════════════════════════════════════════╣${NC}"
     echo -e "${CYAN}║${NC} SAFETY FEATURES:                                               ${CYAN}║${NC}"
     echo -e "${CYAN}║${NC} • Full system snapshots before optimization                   ${CYAN}║${NC}"
     echo -e "${CYAN}║${NC} • Rollback capability to restore previous state               ${CYAN}║${NC}"
     echo -e "${CYAN}║${NC} • Dry-run mode to preview changes without applying            ${CYAN}║${NC}"
     echo -e "${CYAN}║${NC} • Network connectivity checks before disabling services       ${CYAN}║${NC}"
+    echo -e "${CYAN}║${NC} • Process checking before cleaning /tmp                       ${CYAN}║${NC}"
+    echo -e "${CYAN}║${NC} • Smart boot config detection (finds active config)           ${CYAN}║${NC}"
     echo -e "${CYAN}║${NC} • Confirmation prompts for critical operations                ${CYAN}║${NC}"
     echo -e "${CYAN}║${NC} • Automatic snapshot cleanup to prevent disk filling          ${CYAN}║${NC}"
     echo -e "${CYAN}║${NC} • Reboot timeout to prevent half-finished states              ${CYAN}║${NC}"
@@ -115,6 +120,56 @@ show_script_info() {
     echo -e "  • Complete logs at: $LOG_FILE"
     echo ""
     read -p "Press Enter to continue to the main menu..."
+}
+
+# Check for processes using /tmp
+check_tmp_processes() {
+    echo -e "\n${BLUE}=== Checking for Processes Using /tmp ===${NC}"
+
+    local tmp_processes=$(lsof /tmp 2>/dev/null | grep -v "COMMAND" | wc -l)
+
+    if [ "$tmp_processes" -gt 0 ]; then
+        echo -e "${YELLOW}⚠️  Found $tmp_processes process(es) using /tmp:${NC}"
+        echo ""
+        ps x | grep -E "$(lsof /tmp 2>/dev/null | grep -v "COMMAND" | awk '{print $2}' | sort -u | paste -sd '|')" 2>/dev/null || echo "Unable to list processes"
+        echo ""
+        echo -e "${YELLOW}These processes may be relying on files in /tmp${NC}"
+        return 0
+    else
+        echo -e "${GREEN}✅ No processes using /tmp found${NC}"
+        return 1
+    fi
+}
+
+# Safe cleanup with process checking
+safe_cleanup() {
+    echo -e "\n${BLUE}=== Safe Cleanup with Process Check ===${NC}"
+
+    if check_tmp_processes; then
+        echo -e "${RED}⚠️  WARNING: Some processes are using /tmp${NC}"
+        echo -e "${YELLOW}Cleaning /tmp might cause these processes to crash${NC}"
+        read -p "Do you want to see the full process list? (y/N): " -n 1 -r
+        echo
+        if [[ $REPLY =~ ^[Yy]$ ]]; then
+            echo -e "\n${PURPLE}Full process list:${NC}"
+            ps aux | grep -E "$(lsof /tmp 2>/dev/null | grep -v "COMMAND" | awk '{print $2}' | sort -u | paste -sd '|')" 2>/dev/null
+        fi
+
+        echo ""
+        read -p "Force cleanup anyway? This may crash running processes! (y/N): " -n 1 -r
+        echo
+        if [[ ! $REPLY =~ ^[Yy]$ ]]; then
+            echo -e "${YELLOW}Cleanup cancelled${NC}"
+            return 1
+        fi
+    fi
+
+    # Proceed with cleanup
+    echo -e "${YELLOW}Cleaning temporary files...${NC}"
+    rm -rf /tmp/* 2>/dev/null
+    rm -rf /var/tmp/* 2>/dev/null
+    echo -e "${GREEN}✅ Temporary files cleaned${NC}"
+    return 0
 }
 
 # Detect active network interface
@@ -199,6 +254,96 @@ detect_raspberry_pi() {
     return 1
 }
 
+# ENHANCED: Smart boot config detection - finds the ACTIVE config file
+detect_boot_config() {
+    echo -e "\n${BLUE}=== Detecting Active Boot Configuration ===${NC}"
+
+    BOOT_CONFIG_PATH=""
+    BOOT_PARTITION_MOUNT=""
+
+    # Method 1: Check which boot partition is actually mounted
+    local boot_mounts=$(mount | grep -E "/boot" | awk '{print $3}')
+
+    for mount_point in $boot_mounts; do
+        if [ -f "${mount_point}/config.txt" ]; then
+            BOOT_CONFIG_PATH="${mount_point}/config.txt"
+            BOOT_PARTITION_MOUNT="$mount_point"
+            echo -e "${GREEN}✅ Found active boot config at: $BOOT_CONFIG_PATH${NC}"
+            echo -e "${GREEN}   Mount point: $BOOT_PARTITION_MOUNT${NC}"
+            return 0
+        fi
+    done
+
+    # Method 2: Check standard Raspberry Pi paths
+    if [ -f "/boot/firmware/config.txt" ]; then
+        # Check if /boot/firmware is the active boot partition
+        if mount | grep -q "/boot/firmware"; then
+            BOOT_CONFIG_PATH="/boot/firmware/config.txt"
+            BOOT_PARTITION_MOUNT="/boot/firmware"
+            echo -e "${GREEN}✅ Found active boot config at: $BOOT_CONFIG_PATH${NC}"
+            return 0
+        fi
+    fi
+
+    if [ -f "/boot/config.txt" ]; then
+        # Check if /boot is the active boot partition
+        if mount | grep -q "/boot"; then
+            BOOT_CONFIG_PATH="/boot/config.txt"
+            BOOT_PARTITION_MOUNT="/boot"
+            echo -e "${GREEN}✅ Found active boot config at: $BOOT_CONFIG_PATH${NC}"
+            return 0
+        fi
+    fi
+
+    # Method 3: Check both files and let user decide if ambiguous
+    local has_firmware=false
+    local has_boot=false
+
+    [ -f "/boot/firmware/config.txt" ] && has_firmware=true
+    [ -f "/boot/config.txt" ] && has_boot=true
+
+    if $has_firmware && $has_boot; then
+        echo -e "${YELLOW}⚠️  Multiple boot configs found:${NC}"
+        echo -e "  1. /boot/firmware/config.txt"
+        echo -e "  2. /boot/config.txt"
+        echo ""
+        echo -e "${YELLOW}This is unusual. Please select which one is active:${NC}"
+        read -p "Enter choice (1 or 2): " boot_choice
+
+        case $boot_choice in
+            1)
+                BOOT_CONFIG_PATH="/boot/firmware/config.txt"
+                BOOT_PARTITION_MOUNT="/boot/firmware"
+                echo -e "${GREEN}✅ Selected: $BOOT_CONFIG_PATH${NC}"
+                ;;
+            2)
+                BOOT_CONFIG_PATH="/boot/config.txt"
+                BOOT_PARTITION_MOUNT="/boot"
+                echo -e "${GREEN}✅ Selected: $BOOT_CONFIG_PATH${NC}"
+                ;;
+            *)
+                echo -e "${RED}Invalid choice. Using /boot/config.txt as fallback${NC}"
+                BOOT_CONFIG_PATH="/boot/config.txt"
+                BOOT_PARTITION_MOUNT="/boot"
+                ;;
+        esac
+        return 0
+    elif $has_firmware; then
+        BOOT_CONFIG_PATH="/boot/firmware/config.txt"
+        BOOT_PARTITION_MOUNT="/boot/firmware"
+        echo -e "${GREEN}✅ Found boot config at: $BOOT_CONFIG_PATH${NC}"
+        return 0
+    elif $has_boot; then
+        BOOT_CONFIG_PATH="/boot/config.txt"
+        BOOT_PARTITION_MOUNT="/boot"
+        echo -e "${GREEN}✅ Found boot config at: $BOOT_CONFIG_PATH${NC}"
+        return 0
+    fi
+
+    echo -e "${YELLOW}⚠️  No boot config found. This may not be a Raspberry Pi.${NC}"
+    return 1
+}
+
 # Pre-flight safety check
 pre_flight_check() {
     echo -e "\n${BLUE}=== Pre-Flight Safety Check ===${NC}"
@@ -208,6 +353,11 @@ pre_flight_check() {
     detect_debian_version
     detect_raspberry_pi
     detect_active_interface
+
+    # Detect boot config if on Raspberry Pi
+    if [ "$IS_RASPBERRY_PI" = true ]; then
+        detect_boot_config
+    fi
 
     # Check 1: Available disk space
     local available_space=$(df / | awk 'NR==2 {print $4}')
@@ -306,7 +456,7 @@ install_required_tools() {
         echo -e "${GREEN}✅ dselect already installed${NC}"
     fi
 
-    local tools=("curl" "wget" "git" "dnsutils" "numfmt" "lsb-release" "deborphan" "rfkill" "ethtool" "bc")
+    local tools=("curl" "wget" "git" "dnsutils" "numfmt" "lsb-release" "deborphan" "rfkill" "ethtool" "bc" "lsof")
     for tool in "${tools[@]}"; do
         if ! command -v "$tool" &> /dev/null && ! dpkg -l | grep -q "ii  $tool "; then
             echo -e "${YELLOW}Installing $tool...${NC}"
@@ -345,15 +495,19 @@ verify_dbus() {
     fi
 }
 
-# Get config.txt path
+# Get config.txt path (using smart detection)
 get_config_path() {
-    # Raspberry Pi paths
-    if [ -f "/boot/firmware/config.txt" ]; then
-        echo "/boot/firmware/config.txt"
-    elif [ -f "/boot/config.txt" ]; then
-        echo "/boot/config.txt"
+    if [ -n "$BOOT_CONFIG_PATH" ]; then
+        echo "$BOOT_CONFIG_PATH"
     else
-        echo ""
+        # Fallback to old method if smart detection failed
+        if [ -f "/boot/firmware/config.txt" ]; then
+            echo "/boot/firmware/config.txt"
+        elif [ -f "/boot/config.txt" ]; then
+            echo "/boot/config.txt"
+        else
+            echo ""
+        fi
     fi
 }
 
@@ -430,14 +584,17 @@ create_snapshot() {
     [ -d "/etc/dnsmasq.d" ] && cp -r /etc/dnsmasq.d "${snapshot_dir}/" 2>/dev/null && echo -e "${GREEN}  ✅ dnsmasq config backed up${NC}"
     [ -f "/etc/pihole/adlists.list" ] && cp /etc/pihole/adlists.list "${snapshot_dir}/" 2>/dev/null && echo -e "${GREEN}  ✅ Adlists backed up${NC}"
 
-    # Backup boot configs if they exist
+    # Backup boot configs if they exist (using smart detection)
     local config_path=$(get_config_path)
     if [ -n "$config_path" ]; then
         cp "$config_path" "${snapshot_dir}/config.txt.backup"
         echo -e "${GREEN}  ✅ Boot config backed up: ${config_path}${NC}"
 
-        # Also backup boot directory if it exists
-        if [ -d "/boot/firmware" ]; then
+        # Also backup the entire boot partition for safety
+        if [ -n "$BOOT_PARTITION_MOUNT" ] && [ -d "$BOOT_PARTITION_MOUNT" ]; then
+            cp -r "$BOOT_PARTITION_MOUNT" "${snapshot_dir}/boot-partition-backup" 2>/dev/null
+            echo -e "${GREEN}  ✅ Full boot partition backed up from: $BOOT_PARTITION_MOUNT${NC}"
+        elif [ -d "/boot/firmware" ]; then
             cp -r /boot/firmware "${snapshot_dir}/firmware-backup" 2>/dev/null
             echo -e "${GREEN}  ✅ Firmware directory backed up${NC}"
         elif [ -d "/boot" ]; then
@@ -464,10 +621,18 @@ create_snapshot() {
     # Save network config
     ip addr show > "${snapshot_dir}/network-config.txt" 2>/dev/null
 
+    # Save process list
+    ps aux > "${snapshot_dir}/process-list.txt" 2>/dev/null
+
+    # Save mount points for boot detection
+    mount > "${snapshot_dir}/mounts.txt" 2>/dev/null
+
     # Save system info
     echo "Snapshot created: $(date)" > "${snapshot_dir}/snapshot-info.txt"
     echo "Script version: $SCRIPT_VERSION" >> "${snapshot_dir}/snapshot-info.txt"
     echo "User: $USER" >> "${snapshot_dir}/snapshot-info.txt"
+    echo "Boot config: $config_path" >> "${snapshot_dir}/snapshot-info.txt"
+    echo "Boot mount: $BOOT_PARTITION_MOUNT" >> "${snapshot_dir}/snapshot-info.txt"
 
     echo -e "${GREEN}✅ Snapshot created: ${snapshot_name}${NC}"
     echo -e "${GREEN}   Location: ${snapshot_dir}${NC}"
@@ -498,6 +663,41 @@ auto_cleanup_snapshots() {
         echo -e "${GREEN}✅ Old snapshots cleaned up${NC}"
     else
         echo -e "${GREEN}✅ No snapshots older than $SNAPSHOT_RETENTION_DAYS days found${NC}"
+    fi
+}
+
+# Delete all snapshots immediately
+delete_all_snapshots() {
+    echo -e "\n${RED}=== DELETE ALL SNAPSHOTS ===${NC}"
+
+    if [ ! -d "$BACKUP_DIR" ]; then
+        echo -e "${YELLOW}No snapshots directory found.${NC}"
+        return
+    fi
+
+    local snapshot_count=$(ls -1 "$BACKUP_DIR" 2>/dev/null | wc -l)
+
+    if [ "$snapshot_count" -eq 0 ]; then
+        echo -e "${YELLOW}No snapshots to delete.${NC}"
+        return
+    fi
+
+    echo -e "${RED}⚠️  WARNING: This will delete ALL $snapshot_count snapshot(s)!${NC}"
+    echo -e "${YELLOW}Snapshots to be deleted:${NC}"
+    ls -1 "$BACKUP_DIR" | while read snapshot; do
+        local size=$(du -sh "${BACKUP_DIR}/$snapshot" 2>/dev/null | cut -f1)
+        echo -e "  ${YELLOW}→ $snapshot (${size})${NC}"
+    done
+
+    echo ""
+    read -p "Are you ABSOLUTELY sure? (type 'DELETE ALL' to confirm): " confirm
+
+    if [ "$confirm" = "DELETE ALL" ]; then
+        echo -e "${YELLOW}Deleting all snapshots...${NC}"
+        rm -rf "${BACKUP_DIR:?}"/*
+        echo -e "${GREEN}✅ All snapshots deleted successfully${NC}"
+    else
+        echo -e "${YELLOW}Deletion cancelled${NC}"
     fi
 }
 
@@ -586,17 +786,22 @@ rollback_system() {
     [ -d "$snapshot_dir/pihole" ] && cp -r "$snapshot_dir/pihole" /etc/ 2>/dev/null && echo -e "${GREEN}✅ Pi-hole config restored${NC}"
     [ -d "$snapshot_dir/dnsmasq.d" ] && cp -r "$snapshot_dir/dnsmasq.d" /etc/ 2>/dev/null && echo -e "${GREEN}✅ dnsmasq config restored${NC}"
 
-    # Restore boot config from multiple possible backup locations
+    # Restore boot config using smart detection
     if [ -f "$snapshot_dir/config.txt.backup" ]; then
         local config_path=$(get_config_path)
         if [ -n "$config_path" ]; then
             cp "$snapshot_dir/config.txt.backup" "$config_path"
-            echo -e "${GREEN}✅ Boot config restored${NC}"
+            echo -e "${GREEN}✅ Boot config restored to: $config_path${NC}"
         fi
     fi
 
-    # Restore full firmware backup if it exists
-    if [ -d "$snapshot_dir/firmware-backup" ]; then
+    # Restore full boot partition backup if it exists
+    if [ -d "$snapshot_dir/boot-partition-backup" ]; then
+        if [ -n "$BOOT_PARTITION_MOUNT" ] && [ -d "$BOOT_PARTITION_MOUNT" ]; then
+            cp -r "$snapshot_dir/boot-partition-backup"/* "$BOOT_PARTITION_MOUNT/" 2>/dev/null
+            echo -e "${GREEN}✅ Boot partition restored to: $BOOT_PARTITION_MOUNT${NC}"
+        fi
+    elif [ -d "$snapshot_dir/firmware-backup" ]; then
         if [ -d "/boot/firmware" ]; then
             cp -r "$snapshot_dir/firmware-backup"/* /boot/firmware/ 2>/dev/null
             echo -e "${GREEN}✅ Firmware directory restored${NC}"
@@ -696,6 +901,7 @@ quick_system_info() {
 
     if [ "$IS_RASPBERRY_PI" = true ]; then
         echo -e "${GREEN}Hardware:${NC} $RPI_MODEL"
+        echo -e "${GREEN}Boot Config:${NC} $BOOT_CONFIG_PATH"
         # Get CPU temperature if available
         if [ -f /sys/class/thermal/thermal_zone0/temp ]; then
             CPU_TEMP=$(($(cat /sys/class/thermal/thermal_zone0/temp) / 1000))
@@ -719,6 +925,10 @@ quick_system_info() {
         local backup_size=$(du -sh "$BACKUP_DIR" 2>/dev/null | cut -f1)
         echo -e "${GREEN}Snapshots:${NC} $snapshot_count (total size: $backup_size)"
     fi
+
+    # Show processes using /tmp
+    local tmp_processes=$(lsof /tmp 2>/dev/null | grep -v "COMMAND" | wc -l)
+    echo -e "${GREEN}Processes using /tmp:${NC} $tmp_processes"
 }
 
 # View system health
@@ -737,11 +947,15 @@ view_system_health() {
     echo -e "\n${YELLOW}Disk Health:${NC}"
     df -h | grep -E "^/dev|Filesystem"
 
+    echo -e "\n${YELLOW}Processes Using /tmp:${NC}"
+    lsof /tmp 2>/dev/null | head -20 || echo "None"
+
     if [ "$IS_RASPBERRY_PI" = true ]; then
         echo -e "\n${YELLOW}Raspberry Pi Specific:${NC}"
         vcgencmd measure_temp 2>/dev/null
         vcgencmd get_throttled 2>/dev/null
         vcgencmd measure_volts core 2>/dev/null
+        echo -e "${YELLOW}Active Boot Config:${NC} $BOOT_CONFIG_PATH"
     fi
 
     if command -v pihole &> /dev/null; then
@@ -782,10 +996,10 @@ fix_dbus() {
     systemctl status dbus --no-pager | head -3
 }
 
-# Cleanup only
+# Cleanup only (with process check)
 cleanup_only() {
     echo -e "\n${BLUE}=== Safe Cleanup Mode ===${NC}"
-    echo -e "${YELLOW}This will only clean temporary files and logs${NC}"
+    echo -e "${YELLOW}This will clean temporary files and logs${NC}"
     echo -e "${YELLOW}No system changes will be made${NC}\n"
 
     read -p "Proceed with safe cleanup? (y/N): " -n 1 -r
@@ -800,8 +1014,9 @@ cleanup_only() {
     apt autoclean -y
     apt clean
     journalctl --vacuum-time=7d
-    rm -rf /tmp/*
-    rm -rf /var/tmp/*
+
+    # Safe cleanup with process check
+    safe_cleanup
 
     local after_space=$(df -h / | awk 'NR==2 {print $4}')
 
@@ -823,6 +1038,7 @@ verify_packages() {
         "systemd"
         "dbus"
         "python3"
+        "lsof"
     )
 
     # Add Raspberry Pi specific packages if on RPi
@@ -904,6 +1120,7 @@ cleanup_snapshots() {
     echo "2. Remove snapshots older than 30 days"
     echo "3. Keep only the most recent snapshot"
     echo "4. Select specific snapshots to remove"
+    echo "5. DELETE ALL SNAPSHOTS IMMEDIATELY (dangerous)"
     echo "0. Cancel"
 
     read -p "Select option: " cleanup_choice
@@ -948,6 +1165,9 @@ cleanup_snapshots() {
                     echo -e "${GREEN}✅ Removed: $snapshot${NC}"
                 fi
             done
+            ;;
+        5)
+            delete_all_snapshots
             ;;
         0)
             echo -e "${YELLOW}Cancelled${NC}"
@@ -1030,10 +1250,18 @@ dry_run_optimization() {
     local journal_size=$(journalctl --disk-usage 2>/dev/null | awk '{print $3 $4}' || echo "unknown")
     echo -e "  ${YELLOW}→ Journal current size: $journal_size (would be reduced to 100MB)${NC}"
 
-    # Show cache cleanup
+    # Show cache cleanup with process warning
     echo -e "\n${PURPLE}Caches that would be cleaned:${NC}"
     echo -e "  ${YELLOW}→ APT cache (apt clean)${NC}"
-    echo -e "  ${YELLOW}→ Temporary files (/tmp, /var/tmp)${NC}"
+
+    # Check processes using /tmp
+    local tmp_processes=$(lsof /tmp 2>/dev/null | grep -v "COMMAND" | wc -l)
+    if [ "$tmp_processes" -gt 0 ]; then
+        echo -e "  ${RED}→ /tmp directory (WARNING: $tmp_processes processes using /tmp)${NC}"
+    else
+        echo -e "  ${YELLOW}→ /tmp directory${NC}"
+    fi
+    echo -e "  ${YELLOW}→ /var/tmp directory${NC}"
 
     echo -e "\n${GREEN}✅ Dry run completed - no changes were made${NC}"
 }
@@ -1062,11 +1290,11 @@ reinstall_rpi_components() {
         return 0
     fi
 
-    # Backup current config
+    # Backup current config using smart detection
     local config_path=$(get_config_path)
     if [ -n "$config_path" ]; then
         cp "$config_path" "${config_path}.backup-$(date +%Y%m%d-%H%M%S)"
-        echo -e "${GREEN}✅ Boot config backed up${NC}"
+        echo -e "${GREEN}✅ Boot config backed up from: $config_path${NC}"
     fi
 
     # Reinstall kernel and firmware
@@ -1134,6 +1362,17 @@ show_optimization_summary() {
         echo -e "${GREEN}✅ Pi-hole version:${NC} $pihole_version"
     fi
 
+    # Show boot config info
+    if [ "$IS_RASPBERRY_PI" = true ]; then
+        echo -e "${GREEN}✅ Boot config:${NC} $BOOT_CONFIG_PATH"
+    fi
+
+    # Show /tmp process status
+    local tmp_processes=$(lsof /tmp 2>/dev/null | grep -v "COMMAND" | wc -l)
+    if [ "$tmp_processes" -gt 0 ]; then
+        echo -e "${YELLOW}⚠️  Warning: $tmp_processes processes still using /tmp${NC}"
+    fi
+
     echo -e "${GREEN}═══════════════════════════════════════════════════════════════════${NC}"
 }
 
@@ -1145,8 +1384,8 @@ run_full_optimization() {
     echo -e "  2. Create a system snapshot (backup)"
     echo -e "  3. Remove orphaned packages (with confirmation)"
     echo -e "  4. Disable unnecessary services"
-    echo -e "  5. Apply system optimizations"
-    echo -e "  6. Clean temporary files and logs"
+    echo -e "  5. Apply system optimizations (with smart boot config detection)"
+    echo -e "  6. Clean temporary files and logs (with process check)"
     echo -e "  7. Update system packages"
     echo -e "  8. Optimize Pi-hole"
     echo -e "  9. Auto-reboot after $REBOOT_TIMEOUT seconds if no response"
@@ -1241,13 +1480,17 @@ run_full_optimization() {
     done
     echo "Disabled $disabled_count" >> "$OPTIMIZATION_STATS_FILE"
 
-    # Step 5: Raspberry Pi specific optimizations
+    # Step 5: Raspberry Pi specific optimizations (using smart boot config)
     if [ "$IS_RASPBERRY_PI" = true ]; then
         echo -e "\n${YELLOW}Step 5: Applying Raspberry Pi optimizations...${NC}"
 
+        # Re-detect boot config to ensure we have the latest
+        detect_boot_config
+
         # Optimize boot/config.txt with precise checks
         local config_path=$(get_config_path)
-        if [ -n "$config_path" ]; then
+        if [ -n "$config_path" ] && [ -f "$config_path" ]; then
+            echo -e "${YELLOW}Optimizing: $config_path${NC}"
             local changes_made=false
 
             # Check and add gpu_mem if not set
@@ -1280,6 +1523,8 @@ run_full_optimization() {
             if [ "$changes_made" = false ]; then
                 echo -e "${GREEN}✅ Boot config already optimized${NC}"
             fi
+        else
+            echo -e "${YELLOW}⚠️  No boot config found to optimize${NC}"
         fi
 
         # Disable WiFi if safe and user confirmed
@@ -1293,14 +1538,15 @@ run_full_optimization() {
         fi
     fi
 
-    # Step 6: Cleaning system
+    # Step 6: Cleaning system (with process check)
     echo -e "\n${YELLOW}Step 6: Cleaning system...${NC}"
     apt autoremove --purge -y
     apt autoclean -y
     apt clean
     journalctl --vacuum-size=100M
-    rm -rf /tmp/*
-    rm -rf /var/tmp/*
+
+    # Safe cleanup with process check
+    safe_cleanup
     echo -e "${GREEN}✅ System cleaned${NC}"
 
     # Step 7: Update system
@@ -1363,23 +1609,26 @@ show_menu() {
     echo -e "${CYAN}║${NC} 8.  Setup Automated Pi-hole Updates                          ${CYAN}║${NC}"
     echo -e "${CYAN}║${NC} 9.  Quick System Info                                        ${CYAN}║${NC}"
     echo -e "${CYAN}║${NC} 10. View System Health                                       ${CYAN}║${NC}"
-    echo -e "${CYAN}║${NC} 11. Cleanup Only (safe mode)                                 ${CYAN}║${NC}"
+    echo -e "${CYAN}║${NC} 11. Cleanup Only (with process check)                        ${CYAN}║${NC}"
     echo -e "${CYAN}║${NC} 12. Cleanup Old Snapshots (manual)                           ${CYAN}║${NC}"
+    echo -e "${CYAN}║${NC} 13. DELETE ALL SNAPSHOTS (dangerous)                         ${CYAN}║${NC}"
     echo -e "${CYAN}║${NC} 0.  Exit                                                     ${CYAN}║${NC}"
     echo -e "${CYAN}╠══════════════════════════════════════════════════════════════╣${NC}"
     echo -e "${CYAN}║${NC} System: $DETECTED_DISTRO $DETECTED_VERSION"
     if [ "$IS_RASPBERRY_PI" = true ]; then
         echo -e "${CYAN}║${NC} Hardware: $RPI_MODEL"
+        echo -e "${CYAN}║${NC} Boot Config: $BOOT_CONFIG_PATH"
     fi
     echo -e "${CYAN}║${NC} Network: $ACTIVE_INTERFACE ($([ "$IS_WIFI_ACTIVE" = true ] && echo "WiFi" || echo "Ethernet"))"
     echo -e "${CYAN}║${NC} Auto-cleanup: Snapshots > ${SNAPSHOT_RETENTION_DAYS} days | Auto-reboot: ${REBOOT_TIMEOUT}s"
     if [ -d "$BACKUP_DIR" ]; then
         local snapshot_count=$(ls -1 "$BACKUP_DIR" 2>/dev/null | wc -l)
-        echo -e "${CYAN}║${NC} Snapshots: $snapshot_count available"
+        local tmp_processes=$(lsof /tmp 2>/dev/null | grep -v "COMMAND" | wc -l)
+        echo -e "${CYAN}║${NC} Snapshots: $snapshot_count available | /tmp users: $tmp_processes"
     fi
     echo -e "${CYAN}╚══════════════════════════════════════════════════════════════╝${NC}"
     echo ""
-    read -p "Enter your choice [0-12]: " MENU_CHOICE
+    read -p "Enter your choice [0-13]: " MENU_CHOICE
 }
 
 # ============== MAIN EXECUTION ==============
@@ -1456,6 +1705,10 @@ main() {
                 cleanup_snapshots
                 read -p "Press Enter to continue..."
                 ;;
+            13)
+                delete_all_snapshots
+                read -p "Press Enter to continue..."
+                ;;
             0)
                 echo -e "\n${GREEN}══════════════════════════════════════════════════════════════${NC}"
                 echo -e "${GREEN}Thank you for using Pi-hole Debian Ultra Script!${NC}"
@@ -1466,6 +1719,7 @@ main() {
                 echo -e "${YELLOW}https://github.com/waelisa/Raspberry-Pi-Pi-hole-Debian-Ultra-Script${NC}"
                 echo -e "\n${CYAN}══════════════════════════════════════════════════════════════${NC}"
                 echo -e "${CYAN}  \"A stable Pi-hole keeps the internet peaceful!\"${NC}"
+                echo -e "${CYAN}  \"Smart boot config detection for perfect compatibility!\"${NC}"
                 echo -e "${CYAN}══════════════════════════════════════════════════════════════${NC}"
 
                 # Clean up temp files
