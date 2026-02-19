@@ -5,13 +5,23 @@
 # Author:  Wael Isa
 # Website: https://www.wael.name
 # GitHub:  https://github.com/waelisa/Raspberry-Pi-Pi-hole-Debian-Ultra-Script
-# Version: 2.1.8
+# Version: 2.1.9
 # License: MIT
 #
 # Description: Complete system optimization script for systems running
 #              Debian with Pi-hole. Includes safety features,
 #              snapshots, rollback capability, and automated updates.
 #              Compatible with Raspberry Pi and other Debian installations.
+#
+# NEW IN v2.1.9:
+#   • Fixed deborphan detection (handles Debian 13+ where package was removed)
+#   • Fallback orphan detection methods for all Debian versions
+#   • Enhanced error recovery with automatic retry
+#   • Detailed orphaned package analysis with size estimation
+#   • Smart autoremove preview with space savings calculation
+#   • Improved logging with timestamps
+#   • Package removal safety checks
+#   • System health monitoring after operations
 #
 # "A stable Pi-hole keeps the internet peaceful!"
 #
@@ -21,13 +31,15 @@
 # ============== CONFIGURATION ==============
 LOG_FILE="/var/log/pihole-ultra.log"
 BACKUP_DIR="/root/pihole-system-backups"
-SCRIPT_VERSION="2.1.8"
+SCRIPT_VERSION="2.1.9"
 MIN_DISK_SPACE_MB=500  # Minimum 500MB free space required
 MIN_MEMORY_MB=256      # Minimum 256MB free memory recommended
 SNAPSHOT_RETENTION_DAYS=14  # Automatically remove snapshots older than this
 REBOOT_TIMEOUT=60  # Seconds to wait for reboot confirmation before auto-reboot
 DRY_RUN=false
 DRY_RUN_LOG="/tmp/pihole-dryrun-$(date +%Y%m%d-%H%M%S).txt"
+MAX_RETRY_ATTEMPTS=3  # Maximum retry attempts for failed operations
+RETRY_DELAY=5  # Seconds between retries
 exec > >(tee -a "$LOG_FILE") 2>&1
 
 # ============== COLOR CODES FOR MENU ==============
@@ -56,6 +68,7 @@ MENU_CHOICE=""
 TEMP_SELECTIONS="/tmp/dpkg-selections.$$"
 DETECTED_DISTRO=""
 DETECTED_VERSION=""
+DETECTED_CODENAME=""
 IS_RASPBERRY_PI=false
 RPI_MODEL=""
 ACTIVE_INTERFACE=""
@@ -66,6 +79,8 @@ START_DISK_USED=$(df / | awk 'NR==2 {print $3}')
 SCRIPT_RUN_COUNT=0
 BOOT_CONFIG_PATH=""
 BOOT_PARTITION_MOUNT=""
+DEBORPHAN_AVAILABLE=false
+PKG_MANAGER_READY=false
 
 # ============== INITIAL CHECKS ==============
 check_root() {
@@ -73,6 +88,43 @@ check_root() {
         echo -e "${RED}Please run as root (use sudo)${NC}"
         exit 1
     fi
+}
+
+# Enhanced logging with timestamps
+log_message() {
+    local level="$1"
+    local message="$2"
+    local timestamp=$(date '+%Y-%m-%d %H:%M:%S')
+    echo "[$timestamp] [$level] $message" >> "$LOG_FILE"
+}
+
+# Retry function for failed operations
+retry_operation() {
+    local cmd="$1"
+    local description="$2"
+    local attempt=1
+
+    while [ $attempt -le $MAX_RETRY_ATTEMPTS ]; do
+        echo -e "${YELLOW}Attempt $attempt/$MAX_RETRY_ATTEMPTS: $description${NC}"
+        log_message "INFO" "Attempt $attempt: $description"
+
+        if eval "$cmd"; then
+            echo -e "${GREEN}✅ Success on attempt $attempt${NC}"
+            log_message "SUCCESS" "Operation succeeded on attempt $attempt"
+            return 0
+        else
+            if [ $attempt -lt $MAX_RETRY_ATTEMPTS ]; then
+                echo -e "${YELLOW}⚠️  Attempt failed, retrying in $RETRY_DELAY seconds...${NC}"
+                log_message "WARNING" "Attempt $attempt failed, retrying"
+                sleep $RETRY_DELAY
+            else
+                echo -e "${RED}❌ All $MAX_RETRY_ATTEMPTS attempts failed${NC}"
+                log_message "ERROR" "All attempts failed for: $description"
+            fi
+        fi
+        ((attempt++))
+    done
+    return 1
 }
 
 # Display script information and what it does
@@ -86,7 +138,10 @@ show_script_info() {
     echo -e "${CYAN}║${NC}                                                                  ${CYAN}║${NC}"
     echo -e "${CYAN}║${NC} 1. Creating system snapshots (backup) before any changes     ${CYAN}║${NC}"
     echo -e "${CYAN}║${NC} 2. Auto-cleaning snapshots older than ${SNAPSHOT_RETENTION_DAYS} days          ${CYAN}║${NC}"
-    echo -e "${CYAN}║${NC} 3. Removing unnecessary packages (orphaned)                  ${CYAN}║${NC}"
+    echo -e "${CYAN}║${NC} 3. Removing unnecessary packages with smart detection          ${CYAN}║${NC}"
+    echo -e "${CYAN}║${NC}    • Uses deborphan if available                               ${CYAN}║${NC}"
+    echo -e "${CYAN}║${NC}    • Fallback methods for Debian 13+ (Trixie)                  ${CYAN}║${NC}"
+    echo -e "${CYAN}║${NC}    • Shows space savings before removal                         ${CYAN}║${NC}"
     echo -e "${CYAN}║${NC} 4. Disabling non-essential services                           ${CYAN}║${NC}"
     echo -e "${CYAN}║${NC} 5. Optimizing system for Pi-hole performance                  ${CYAN}║${NC}"
     echo -e "${CYAN}║${NC} 6. Cleaning temporary files and logs (with process check)     ${CYAN}║${NC}"
@@ -96,6 +151,7 @@ show_script_info() {
     echo -e "${CYAN}║${NC}10. Auto-reboot after ${REBOOT_TIMEOUT} seconds if no response             ${CYAN}║${NC}"
     echo -e "${CYAN}║${NC}11. Smart boot config detection (finds active config)          ${CYAN}║${NC}"
     echo -e "${CYAN}║${NC}12. Dry Run log export (saves changes to /tmp)                 ${CYAN}║${NC}"
+    echo -e "${CYAN}║${NC}13. Retry mechanism for failed operations (3 attempts)         ${CYAN}║${NC}"
     echo -e "${CYAN}╠══════════════════════════════════════════════════════════════╣${NC}"
     echo -e "${CYAN}║${NC} SAFETY FEATURES:                                               ${CYAN}║${NC}"
     echo -e "${CYAN}║${NC} • Full system snapshots before optimization                   ${CYAN}║${NC}"
@@ -107,12 +163,14 @@ show_script_info() {
     echo -e "${CYAN}║${NC} • Confirmation prompts for critical operations                ${CYAN}║${NC}"
     echo -e "${CYAN}║${NC} • Automatic snapshot cleanup to prevent disk filling          ${CYAN}║${NC}"
     echo -e "${CYAN}║${NC} • Reboot timeout to prevent half-finished states              ${CYAN}║${NC}"
+    echo -e "${CYAN}║${NC} • Package removal size estimation and confirmation            ${CYAN}║${NC}"
     echo -e "${CYAN}╚══════════════════════════════════════════════════════════════╝${NC}"
     echo ""
     echo -e "${GREEN}This script is now production-ready and has been tested on:${NC}"
-    echo -e "  • Debian 10 (Buster)"
-    echo -e "  • Debian 11 (Bullseye)"
-    echo -e "  • Debian 12 (Bookworm)"
+    echo -e "  • Debian 10 (Buster) - Full support"
+    echo -e "  • Debian 11 (Bullseye) - Full support"
+    echo -e "  • Debian 12 (Bookworm) - Full support"
+    echo -e "  • Debian 13 (Trixie) - Fallback orphan detection"
     echo -e "  • Raspberry Pi OS (all versions)"
     echo -e "  • Ubuntu 20.04 LTS and 22.04 LTS"
     echo ""
@@ -121,25 +179,52 @@ show_script_info() {
     echo -e "  • Rollback capability (Option 4)"
     echo -e "  • Complete logs at: $LOG_FILE"
     echo -e "  • Dry Run logs at: /tmp/pihole-dryrun-*.txt"
+    echo -e "  • Auto-retry for failed operations (3 attempts)"
     echo ""
     read -p "Press Enter to continue to the main menu..."
+}
+
+# Enhanced system detection
+detect_system_details() {
+    log_message "INFO" "Detecting system details"
+
+    # Get distribution codename
+    if [ -f /etc/os-release ]; then
+        source /etc/os-release
+        DETECTED_CODENAME="$VERSION_CODENAME"
+        if [ -z "$DETECTED_CODENAME" ]; then
+            # Fallback for older systems
+            DETECTED_CODENAME=$(lsb_release -sc 2>/dev/null || echo "unknown")
+        fi
+    fi
+
+    echo -e "${GREEN}System Details:${NC}"
+    echo -e "  • Distribution: $DETECTED_DISTRO $DETECTED_VERSION"
+    echo -e "  • Codename: $DETECTED_CODENAME"
+    echo -e "  • Architecture: $(dpkg --print-architecture)"
+    echo -e "  • Kernel: $(uname -r)"
+
+    log_message "INFO" "System: $DETECTED_DISTRO $DETECTED_VERSION, Codename: $DETECTED_CODENAME"
 }
 
 # Check for processes using /tmp
 check_tmp_processes() {
     echo -e "\n${BLUE}=== Checking for Processes Using /tmp ===${NC}"
+    log_message "INFO" "Checking /tmp processes"
 
     local tmp_processes=$(lsof /tmp 2>/dev/null | grep -v "COMMAND" | wc -l)
 
     if [ "$tmp_processes" -gt 0 ]; then
         echo -e "${YELLOW}⚠️  Found $tmp_processes process(es) using /tmp:${NC}"
         echo ""
-        ps x | grep -E "$(lsof /tmp 2>/dev/null | grep -v "COMMAND" | awk '{print $2}' | sort -u | paste -sd '|')" 2>/dev/null || echo "Unable to list processes"
+        lsof /tmp 2>/dev/null | head -20
         echo ""
         echo -e "${YELLOW}These processes may be relying on files in /tmp${NC}"
+        log_message "WARNING" "Found $tmp_processes processes using /tmp"
         return 0
     else
         echo -e "${GREEN}✅ No processes using /tmp found${NC}"
+        log_message "INFO" "No processes using /tmp"
         return 1
     fi
 }
@@ -147,6 +232,7 @@ check_tmp_processes() {
 # Safe cleanup with process checking
 safe_cleanup() {
     echo -e "\n${BLUE}=== Safe Cleanup with Process Check ===${NC}"
+    log_message "INFO" "Starting safe cleanup"
 
     if check_tmp_processes; then
         echo -e "${RED}⚠️  WARNING: Some processes are using /tmp${NC}"
@@ -163,39 +249,63 @@ safe_cleanup() {
         echo
         if [[ ! $REPLY =~ ^[Yy]$ ]]; then
             echo -e "${YELLOW}Cleanup cancelled${NC}"
+            log_message "INFO" "Cleanup cancelled by user"
             return 1
         fi
     fi
+
+    # Calculate space before cleanup
+    local before_tmp=$(du -sk /tmp 2>/dev/null | cut -f1)
+    local before_vartmp=$(du -sk /var/tmp 2>/dev/null | cut -f1)
+    local before_total=$((before_tmp + before_vartmp))
 
     # Proceed with cleanup
     echo -e "${YELLOW}Cleaning temporary files...${NC}"
     rm -rf /tmp/* 2>/dev/null
     rm -rf /var/tmp/* 2>/dev/null
+
+    # Calculate space after cleanup
+    local after_tmp=$(du -sk /tmp 2>/dev/null | cut -f1)
+    local after_vartmp=$(du -sk /var/tmp 2>/dev/null | cut -f1)
+    local after_total=$((after_tmp + after_vartmp))
+    local saved=$((before_total - after_total))
+
     echo -e "${GREEN}✅ Temporary files cleaned${NC}"
+    echo -e "${GREEN}   Space saved: $(numfmt --to=iec ${saved}K)${NC}"
+    log_message "INFO" "Cleanup completed, saved $(numfmt --to=iec ${saved}K)"
     return 0
 }
 
 # Detect active network interface
 detect_active_interface() {
     echo -e "\n${BLUE}=== Detecting Active Network Connection ===${NC}"
+    log_message "INFO" "Detecting active network interface"
 
     # Get default route interface
     ACTIVE_INTERFACE=$(ip route | grep default | awk '{print $5}' | head -1)
 
     if [ -n "$ACTIVE_INTERFACE" ]; then
         echo -e "${GREEN}✅ Default route via: $ACTIVE_INTERFACE${NC}"
+        log_message "INFO" "Active interface: $ACTIVE_INTERFACE"
 
         # Check if it's a WiFi interface
         if [[ "$ACTIVE_INTERFACE" == wlan* ]] || [[ "$ACTIVE_INTERFACE" == wlp* ]]; then
             IS_WIFI_ACTIVE=true
             echo -e "${YELLOW}⚠️  Active connection is via WIFI ($ACTIVE_INTERFACE)${NC}"
             echo -e "${YELLOW}   Disabling WiFi would disconnect this session!${NC}"
+            log_message "WARNING" "Active connection is WiFi"
         else
             IS_WIFI_ACTIVE=false
             echo -e "${GREEN}✅ Active connection is via Ethernet (safe to disable WiFi)${NC}"
+            log_message "INFO" "Active connection is Ethernet"
         fi
+
+        # Get IP address
+        local ip_addr=$(ip -4 addr show "$ACTIVE_INTERFACE" | grep -oP '(?<=inet\s)\d+(\.\d+){3}' | head -1)
+        echo -e "${GREEN}   IP Address: $ip_addr${NC}"
     else
         echo -e "${RED}❌ Could not detect active network interface${NC}"
+        log_message "ERROR" "Could not detect active interface"
         IS_WIFI_ACTIVE=false
     fi
 }
@@ -206,15 +316,20 @@ detect_debian_version() {
         DETECTED_VERSION=$(cat /etc/debian_version)
         DETECTED_DISTRO="Debian"
         echo -e "${GREEN}✅ Detected: Debian $DETECTED_VERSION${NC}"
+        log_message "INFO" "Detected Debian $DETECTED_VERSION"
 
         # Check if it's actually Raspbian/Raspberry Pi OS (which is Debian-based)
         if grep -q "Raspbian" /etc/os-release 2>/dev/null; then
             DETECTED_DISTRO="Raspbian"
             echo -e "${GREEN}✅ Detected: Raspbian/Debian $DETECTED_VERSION${NC}"
+            log_message "INFO" "Detected Raspbian"
         elif grep -q "Raspberry Pi OS" /etc/os-release 2>/dev/null; then
             DETECTED_DISTRO="Raspberry Pi OS"
             echo -e "${GREEN}✅ Detected: Raspberry Pi OS (Debian $DETECTED_VERSION)${NC}"
+            log_message "INFO" "Detected Raspberry Pi OS"
         fi
+
+        detect_system_details
         return 0
     elif [ -f /etc/os-release ]; then
         # Try to get from os-release
@@ -223,12 +338,15 @@ detect_debian_version() {
             DETECTED_VERSION="$VERSION_ID"
             DETECTED_DISTRO="$NAME"
             echo -e "${GREEN}✅ Detected: $NAME $VERSION_ID${NC}"
+            log_message "INFO" "Detected $NAME $VERSION_ID"
+            detect_system_details
             return 0
         fi
     fi
 
     echo -e "${YELLOW}⚠️  Warning: This doesn't appear to be a Debian-based system${NC}"
     echo -e "${YELLOW}   Some features may not work correctly${NC}"
+    log_message "WARNING" "Not a Debian-based system"
     DETECTED_DISTRO="Unknown"
     DETECTED_VERSION="Unknown"
     return 1
@@ -241,6 +359,7 @@ detect_raspberry_pi() {
         if [[ "$RPI_MODEL" == *"Raspberry Pi"* ]]; then
             IS_RASPBERRY_PI=true
             echo -e "${GREEN}✅ Raspberry Pi detected: $RPI_MODEL${NC}"
+            log_message "INFO" "Raspberry Pi detected: $RPI_MODEL"
             return 0
         fi
     fi
@@ -250,6 +369,7 @@ detect_raspberry_pi() {
         IS_RASPBERRY_PI=true
         RPI_MODEL="Raspberry Pi (from cpuinfo)"
         echo -e "${GREEN}✅ Raspberry Pi detected${NC}"
+        log_message "INFO" "Raspberry Pi detected from cpuinfo"
         return 0
     fi
 
@@ -260,6 +380,7 @@ detect_raspberry_pi() {
 # ENHANCED: Smart boot config detection - finds the ACTIVE config file
 detect_boot_config() {
     echo -e "\n${BLUE}=== Detecting Active Boot Configuration ===${NC}"
+    log_message "INFO" "Detecting boot config"
 
     BOOT_CONFIG_PATH=""
     BOOT_PARTITION_MOUNT=""
@@ -273,83 +394,424 @@ detect_boot_config() {
             BOOT_PARTITION_MOUNT="$mount_point"
             echo -e "${GREEN}✅ Found active boot config at: $BOOT_CONFIG_PATH${NC}"
             echo -e "${GREEN}   Mount point: $BOOT_PARTITION_MOUNT${NC}"
+            log_message "INFO" "Boot config found at $BOOT_CONFIG_PATH"
             return 0
         fi
     done
 
     # Method 2: Check standard Raspberry Pi paths
     if [ -f "/boot/firmware/config.txt" ]; then
-        # Check if /boot/firmware is the active boot partition
         if mount | grep -q "/boot/firmware"; then
             BOOT_CONFIG_PATH="/boot/firmware/config.txt"
             BOOT_PARTITION_MOUNT="/boot/firmware"
             echo -e "${GREEN}✅ Found active boot config at: $BOOT_CONFIG_PATH${NC}"
+            log_message "INFO" "Boot config found at $BOOT_CONFIG_PATH"
             return 0
         fi
     fi
 
     if [ -f "/boot/config.txt" ]; then
-        # Check if /boot is the active boot partition
         if mount | grep -q "/boot"; then
             BOOT_CONFIG_PATH="/boot/config.txt"
             BOOT_PARTITION_MOUNT="/boot"
             echo -e "${GREEN}✅ Found active boot config at: $BOOT_CONFIG_PATH${NC}"
+            log_message "INFO" "Boot config found at $BOOT_CONFIG_PATH"
             return 0
         fi
     fi
 
-    # Method 3: Check both files and let user decide if ambiguous
-    local has_firmware=false
-    local has_boot=false
+    echo -e "${YELLOW}⚠️  No boot config found. This may not be a Raspberry Pi.${NC}"
+    log_message "WARNING" "No boot config found"
+    return 1
+}
 
-    [ -f "/boot/firmware/config.txt" ] && has_firmware=true
-    [ -f "/boot/config.txt" ] && has_boot=true
+# ============== IMPROVED ORPHANED PACKAGE HANDLING ==============
+check_deborphan_availability() {
+    echo -e "\n${BLUE}=== Checking deborphan Availability ===${NC}"
+    log_message "INFO" "Checking deborphan availability"
 
-    if $has_firmware && $has_boot; then
-        echo -e "${YELLOW}⚠️  Multiple boot configs found:${NC}"
-        echo -e "  1. /boot/firmware/config.txt"
-        echo -e "  2. /boot/config.txt"
-        echo ""
-        echo -e "${YELLOW}This is unusual. Please select which one is active:${NC}"
-        read -p "Enter choice (1 or 2): " boot_choice
+    DEBORPHAN_AVAILABLE=false
 
-        case $boot_choice in
-            1)
-                BOOT_CONFIG_PATH="/boot/firmware/config.txt"
-                BOOT_PARTITION_MOUNT="/boot/firmware"
-                echo -e "${GREEN}✅ Selected: $BOOT_CONFIG_PATH${NC}"
-                ;;
-            2)
-                BOOT_CONFIG_PATH="/boot/config.txt"
-                BOOT_PARTITION_MOUNT="/boot"
-                echo -e "${GREEN}✅ Selected: $BOOT_CONFIG_PATH${NC}"
-                ;;
-            *)
-                echo -e "${RED}Invalid choice. Using /boot/config.txt as fallback${NC}"
-                BOOT_CONFIG_PATH="/boot/config.txt"
-                BOOT_PARTITION_MOUNT="/boot"
-                ;;
-        esac
-        return 0
-    elif $has_firmware; then
-        BOOT_CONFIG_PATH="/boot/firmware/config.txt"
-        BOOT_PARTITION_MOUNT="/boot/firmware"
-        echo -e "${GREEN}✅ Found boot config at: $BOOT_CONFIG_PATH${NC}"
-        return 0
-    elif $has_boot; then
-        BOOT_CONFIG_PATH="/boot/config.txt"
-        BOOT_PARTITION_MOUNT="/boot"
-        echo -e "${GREEN}✅ Found boot config at: $BOOT_CONFIG_PATH${NC}"
+    # Check if deborphan is installed
+    if command -v deborphan &> /dev/null; then
+        DEBORPHAN_AVAILABLE=true
+        local version=$(deborphan --version 2>/dev/null | head -1)
+        echo -e "${GREEN}✅ deborphan is installed - Version: $version${NC}"
+        log_message "INFO" "deborphan installed"
         return 0
     fi
 
-    echo -e "${YELLOW}⚠️  No boot config found. This may not be a Raspberry Pi.${NC}"
+    # Check if it's available in repositories
+    if apt-cache show deborphan &> /dev/null; then
+        local version=$(apt-cache policy deborphan | grep Candidate | awk '{print $2}')
+        echo -e "${YELLOW}⚠️  deborphan is not installed but available (version $version)${NC}"
+        log_message "INFO" "deborphan available in repos"
+
+        read -p "   Install deborphan now? (y/N): " -n 1 -r
+        echo
+        if [[ $REPLY =~ ^[Yy]$ ]]; then
+            echo -e "${YELLOW}Installing deborphan...${NC}"
+            if apt-get install -y deborphan; then
+                DEBORPHAN_AVAILABLE=true
+                echo -e "${GREEN}✅ deborphan installed successfully${NC}"
+                log_message "INFO" "deborphan installed"
+                return 0
+            else
+                echo -e "${RED}❌ Failed to install deborphan${NC}"
+                log_message "ERROR" "Failed to install deborphan"
+            fi
+        fi
+    else
+        echo -e "${YELLOW}⚠️  deborphan is not available in your repositories${NC}"
+        echo -e "${YELLOW}   This is normal on Debian 13+ (Trixie) and newer systems${NC}"
+        log_message "INFO" "deborphan not in repos - using fallback"
+    fi
+
     return 1
+}
+
+# Calculate size of packages before removal
+get_package_size() {
+    local pkg="$1"
+    local size=$(dpkg-query -W -f='${Installed-Size}\n' "$pkg" 2>/dev/null | head -1)
+    if [ -n "$size" ] && [ "$size" -gt 0 ]; then
+        echo "$size"
+    else
+        echo "0"
+    fi
+}
+
+# Show package removal preview with size estimates
+preview_package_removal() {
+    local packages="$1"
+    local total_size=0
+    local count=0
+    local pkg_list=""
+
+    echo -e "\n${PURPLE}Package removal preview:${NC}"
+    echo "────────────────────────────────────"
+
+    for pkg in $packages; do
+        local size=$(get_package_size "$pkg")
+        total_size=$((total_size + size))
+        count=$((count + 1))
+        pkg_list="$pkg_list $pkg"
+        echo -e "  ${YELLOW}→ $pkg${NC} ($(numfmt --to=iec ${size}K))"
+    done
+
+    echo "────────────────────────────────────"
+    echo -e "Total packages: $count"
+    echo -e "Total space to be freed: $(numfmt --to=iec ${total_size}K)"
+    echo ""
+
+    return $total_size
+}
+
+# Fallback method using apt and dpkg (works on all systems)
+find_orphaned_packages_fallback() {
+    echo -e "\n${YELLOW}Using fallback method to find orphaned packages...${NC}"
+    echo -e "${YELLOW}This method works on all Debian versions including 13+ (Trixie).${NC}"
+    log_message "INFO" "Using fallback orphan detection"
+
+    local total_found=0
+    local autoremove_list=""
+    local manual_orphans=""
+
+    # Method 1: Use apt autoremove --dry-run to see what would be removed
+    echo -e "\n${PURPLE}1. Packages that 'apt autoremove' would remove:${NC}"
+    autoremove_list=$(apt-get autoremove --dry-run 2>/dev/null | grep "^Remv" | awk '{print $2}')
+
+    if [ -n "$autoremove_list" ]; then
+        preview_package_removal "$autoremove_list"
+        total_found=$((total_found + $(echo "$autoremove_list" | wc -l)))
+    else
+        echo -e "${GREEN}  ✓ No packages found by autoremove${NC}"
+    fi
+
+    # Method 2: Find orphaned libraries (packages with no reverse dependencies)
+    echo -e "\n${PURPLE}2. Checking for orphaned libraries...${NC}"
+    local lib_orphans=""
+    local lib_count=0
+
+    # Check libraries that might be orphaned
+    for lib in $(dpkg -l | grep "^ii.*lib" | awk '{print $2}' | grep -E "^(lib)" | head -50); do
+        # Skip essential libraries
+        if dpkg -s "$lib" 2>/dev/null | grep -q "Essential: yes"; then
+            continue
+        fi
+
+        # Check if any installed package depends on this library
+        local depends=$(apt-cache rdepends --installed "$lib" 2>/dev/null | grep -v "^  " | grep -v "^Reverse Depends" | tail -n +2 | grep -v "lib" | wc -l)
+        if [ "$depends" -eq 0 ]; then
+            lib_orphans="$lib_orphans $lib"
+            lib_count=$((lib_count + 1))
+        fi
+    done
+
+    if [ "$lib_count" -gt 0 ]; then
+        preview_package_removal "$lib_orphans"
+        total_found=$((total_found + lib_count))
+    else
+        echo -e "${GREEN}  ✓ No orphaned libraries found in sample${NC}"
+    fi
+
+    # Method 3: Find packages that are not required by any other package
+    echo -e "\n${PURPLE}3. Checking for manually installed packages without dependents...${NC}"
+    local orphan_candidates=""
+    local candidate_count=0
+    local manual_pkgs=$(apt-mark showmanual | grep -v "^lib" | head -30)
+
+    for pkg in $manual_pkgs; do
+        # Skip essential packages
+        if dpkg -s "$pkg" 2>/dev/null | grep -q "Essential: yes"; then
+            continue
+        fi
+
+        # Skip if it's a critical system package
+        if echo "$pkg" | grep -E "^(systemd|apt|bash|coreutils|dpkg|grub|linux-image|openssh)" >/dev/null; then
+            continue
+        fi
+
+        # Check if any installed package depends on this
+        local rdeps=$(apt-cache rdepends --installed "$pkg" 2>/dev/null | grep -v "^  " | grep -v "^Reverse Depends" | tail -n +2 | grep -v "$pkg" | wc -l)
+        if [ "$rdeps" -eq 0 ]; then
+            orphan_candidates="$orphan_candidates $pkg"
+            candidate_count=$((candidate_count + 1))
+        fi
+    done
+
+    if [ "$candidate_count" -gt 0 ]; then
+        preview_package_removal "$orphan_candidates"
+        total_found=$((total_found + candidate_count))
+        echo -e "${YELLOW}Note: These are candidates - verify before removal!${NC}"
+    else
+        echo -e "${GREEN}  ✓ No orphan candidates found${NC}"
+    fi
+
+    echo -e "\n${YELLOW}Total potential orphaned packages found: $total_found${NC}"
+    log_message "INFO" "Fallback detection found $total_found potential orphans"
+
+    # Store results for later removal
+    echo "$autoremove_list" > /tmp/pihole-autoremove.tmp
+    echo "$lib_orphans" > /tmp/pihole-lib-orphans.tmp
+    echo "$orphan_candidates" > /tmp/pihole-candidates.tmp
+
+    return $total_found
+}
+
+# Check orphaned packages with deborphan
+check_orphaned_with_deborphan() {
+    echo -e "\n${BLUE}=== Checking for Orphaned Packages (deborphan) ===${NC}"
+    log_message "INFO" "Running deborphan check"
+
+    local total_orphans=0
+    local orphans=""
+
+    # Standard orphan check
+    orphans=$(deborphan 2>/dev/null)
+    if [ -n "$orphans" ]; then
+        local count=$(echo "$orphans" | wc -l)
+        total_orphans=$((total_orphans + count))
+        echo -e "\n${PURPLE}Standard orphaned packages ($count found):${NC}"
+        preview_package_removal "$orphans"
+    fi
+
+    # Check for development orphans
+    local dev_orphans=$(deborphan --guess-dev 2>/dev/null | head -20)
+    if [ -n "$dev_orphans" ]; then
+        local dev_count=$(echo "$dev_orphans" | wc -l)
+        total_orphans=$((total_orphans + dev_count))
+        echo -e "\n${PURPLE}Development orphaned packages ($dev_count found):${NC}"
+        preview_package_removal "$dev_orphans"
+    fi
+
+    # Check for data orphans
+    local data_orphans=$(deborphan --guess-data 2>/dev/null | head -20)
+    if [ -n "$data_orphans" ]; then
+        local data_count=$(echo "$data_orphans" | wc -l)
+        total_orphans=$((total_orphans + data_count))
+        echo -e "\n${PURPLE}Data orphaned packages ($data_count found):${NC}"
+        preview_package_removal "$data_orphans"
+    fi
+
+    echo -e "\n${GREEN}Total orphaned packages found: $total_orphans${NC}"
+    log_message "INFO" "deborphan found $total_orphans orphans"
+
+    # Store results
+    echo "$orphans" > /tmp/pihole-deborphan.tmp
+    echo "$dev_orphans" > /tmp/pihole-dev-orphans.tmp
+    echo "$data_orphans" > /tmp/pihole-data-orphans.tmp
+
+    return $total_orphans
+}
+
+# Main orphaned package check
+check_orphaned_packages() {
+    echo -e "\n${BLUE}=== Checking for Orphaned Packages ===${NC}"
+    log_message "INFO" "Starting orphaned package check"
+
+    # Check if deborphan is available
+    check_deborphan_availability
+
+    if [ "$DEBORPHAN_AVAILABLE" = true ]; then
+        check_orphaned_with_deborphan
+    else
+        find_orphaned_packages_fallback
+    fi
+}
+
+# Remove orphaned packages with safety checks
+remove_orphaned_packages() {
+    echo -e "\n${BLUE}=== Removing Orphaned Packages ===${NC}"
+    log_message "INFO" "Starting orphaned package removal"
+
+    local removal_mode=""
+    local packages_to_remove=""
+
+    echo -e "${PURPLE}Removal Options:${NC}"
+    echo "1. Remove autoremove packages only (safest)"
+    echo "2. Remove orphaned libraries (moderate risk)"
+    echo "3. Remove all detected orphans (aggressive)"
+    echo "4. Remove with recursive cleanup (very aggressive)"
+    echo "5. Select packages individually"
+    echo "6. Skip removal"
+    echo ""
+    read -p "Choose option (1-6): " removal_choice
+
+    case $removal_choice in
+        1)
+            if [ -f /tmp/pihole-autoremove.tmp ]; then
+                packages_to_remove=$(cat /tmp/pihole-autoremove.tmp)
+            fi
+            removal_mode="autoremove only"
+            ;;
+        2)
+            if [ -f /tmp/pihole-lib-orphans.tmp ]; then
+                packages_to_remove=$(cat /tmp/pihole-lib-orphans.tmp)
+            fi
+            removal_mode="orphaned libraries"
+            ;;
+        3)
+            if [ -f /tmp/pihole-autoremove.tmp ]; then
+                packages_to_remove="$packages_to_remove $(cat /tmp/pihole-autoremove.tmp)"
+            fi
+            if [ -f /tmp/pihole-lib-orphans.tmp ]; then
+                packages_to_remove="$packages_to_remove $(cat /tmp/pihole-lib-orphans.tmp)"
+            fi
+            if [ -f /tmp/pihole-candidates.tmp ]; then
+                packages_to_remove="$packages_to_remove $(cat /tmp/pihole-candidates.tmp)"
+            fi
+            if [ -f /tmp/pihole-deborphan.tmp ]; then
+                packages_to_remove="$packages_to_remove $(cat /tmp/pihole-deborphan.tmp)"
+            fi
+            if [ -f /tmp/pihole-dev-orphans.tmp ]; then
+                packages_to_remove="$packages_to_remove $(cat /tmp/pihole-dev-orphans.tmp)"
+            fi
+            removal_mode="all detected orphans"
+            ;;
+        4)
+            echo -e "${RED}⚠️  RECURSIVE MODE - This will keep removing until no orphans remain${NC}"
+            echo -e "${YELLOW}This can be very aggressive - make sure you have a backup!${NC}"
+            read -p "Are you absolutely sure? (type 'yes' to confirm): " confirm
+            if [ "$confirm" = "yes" ]; then
+                local loop_count=0
+                while [ "$(deborphan 2>/dev/null | wc -l)" -gt 0 ] && [ $loop_count -lt 10 ]; do
+                    echo -e "${YELLOW}Pass $((loop_count+1)): Removing orphans...${NC}"
+                    deborphan 2>/dev/null | xargs apt-get remove --purge -y
+                    loop_count=$((loop_count + 1))
+                done
+                echo -e "${GREEN}✅ Recursive cleanup completed after $loop_count passes${NC}"
+                log_message "INFO" "Recursive cleanup completed after $loop_count passes"
+                return 0
+            else
+                echo -e "${YELLOW}Cancelled${NC}"
+                return 0
+            fi
+            ;;
+        5)
+            # Collect all orphans
+            local all_orphans=""
+            for tmp in /tmp/pihole-*.tmp; do
+                if [ -f "$tmp" ]; then
+                    all_orphans="$all_orphans $(cat "$tmp")"
+                fi
+            done
+            all_orphans=$(echo "$all_orphans" | tr ' ' '\n' | sort -u)
+
+            echo -e "\n${PURPLE}Available orphaned packages:${NC}"
+            local i=1
+            local pkg_array=()
+            for pkg in $all_orphans; do
+                if [ -n "$pkg" ]; then
+                    local size=$(get_package_size "$pkg")
+                    echo "$i. $pkg ($(numfmt --to=iec ${size}K))"
+                    pkg_array[$i]="$pkg"
+                    i=$((i+1))
+                fi
+            done
+
+            echo ""
+            read -p "Enter package numbers to remove (comma-separated, e.g., 1,3,5): " selected
+            IFS=',' read -ra indices <<< "$selected"
+            for idx in "${indices[@]}"; do
+                if [[ "$idx" =~ ^[0-9]+$ ]] && [ -n "${pkg_array[$idx]}" ]; then
+                    packages_to_remove="$packages_to_remove ${pkg_array[$idx]}"
+                fi
+            done
+            removal_mode="selected packages"
+            ;;
+        6)
+            echo -e "${YELLOW}Skipping orphaned package removal${NC}"
+            log_message "INFO" "Orphan removal skipped"
+            return 0
+            ;;
+        *)
+            echo -e "${RED}Invalid option${NC}"
+            return 1
+            ;;
+    esac
+
+    # Remove duplicates and empty lines
+    packages_to_remove=$(echo "$packages_to_remove" | tr ' ' '\n' | sort -u | grep -v '^$')
+
+    if [ -z "$packages_to_remove" ]; then
+        echo -e "${YELLOW}No packages selected for removal${NC}"
+        return 0
+    fi
+
+    # Preview removal
+    echo -e "\n${YELLOW}Packages to be removed ($removal_mode):${NC}"
+    preview_package_removal "$packages_to_remove"
+
+    read -p "Proceed with removal? (y/N): " -n 1 -r
+    echo
+    if [[ ! $REPLY =~ ^[Yy]$ ]]; then
+        echo -e "${YELLOW}Removal cancelled${NC}"
+        log_message "INFO" "Removal cancelled"
+        return 0
+    fi
+
+    # Perform removal with retry
+    local remove_cmd="apt-get remove --purge -y $packages_to_remove"
+    if retry_operation "$remove_cmd" "Removing orphaned packages"; then
+        echo -e "${GREEN}✅ Orphaned packages removed successfully${NC}"
+        log_message "INFO" "Orphan removal completed"
+
+        # Run autoremove to clean up any remaining dependencies
+        apt-get autoremove --purge -y
+    else
+        echo -e "${RED}❌ Failed to remove orphaned packages${NC}"
+        log_message "ERROR" "Orphan removal failed"
+    fi
+
+    # Clean up temp files
+    rm -f /tmp/pihole-*.tmp
 }
 
 # Pre-flight safety check
 pre_flight_check() {
     echo -e "\n${BLUE}=== Pre-Flight Safety Check ===${NC}"
+    log_message "INFO" "Starting pre-flight checks"
     local checks_passed=true
 
     # Detect system info
@@ -366,12 +828,13 @@ pre_flight_check() {
     local available_space=$(df / | awk 'NR==2 {print $4}')
     local available_space_mb=$((available_space / 1024))
 
-    echo -e "${YELLOW}Checking disk space...${NC}"
+    echo -e "\n${YELLOW}Checking disk space...${NC}"
     echo -e "  Available: ${available_space_mb}MB"
     echo -e "  Required: ${MIN_DISK_SPACE_MB}MB"
 
     if [ "$available_space_mb" -lt "$MIN_DISK_SPACE_MB" ]; then
         echo -e "${RED}  ❌ Insufficient disk space!${NC}"
+        log_message "ERROR" "Insufficient disk space: ${available_space_mb}MB"
         checks_passed=false
     else
         echo -e "${GREEN}  ✅ Sufficient disk space${NC}"
@@ -385,6 +848,7 @@ pre_flight_check() {
 
     if [ "$available_mem" -lt "$MIN_MEMORY_MB" ]; then
         echo -e "${YELLOW}  ⚠️  Low memory warning - operations may be slow${NC}"
+        log_message "WARNING" "Low memory: ${available_mem}MB"
     else
         echo -e "${GREEN}  ✅ Adequate memory${NC}"
     fi
@@ -395,6 +859,7 @@ pre_flight_check() {
         echo -e "${GREEN}  ✅ Internet connected${NC}"
     else
         echo -e "${RED}  ❌ No internet connection!${NC}"
+        log_message "ERROR" "No internet connection"
         checks_passed=false
     fi
 
@@ -404,6 +869,7 @@ pre_flight_check() {
         echo -e "${GREEN}  ✅ DNS working${NC}"
     else
         echo -e "${YELLOW}  ⚠️  DNS resolution failed (Pi-hole may not be running)${NC}"
+        log_message "WARNING" "DNS resolution failed"
     fi
 
     # Check 5: Write permission to backup directory
@@ -413,16 +879,19 @@ pre_flight_check() {
         echo -e "${GREEN}  ✅ Backup directory writable${NC}"
     else
         echo -e "${RED}  ❌ Cannot write to backup directory!${NC}"
+        log_message "ERROR" "Backup directory not writable"
         checks_passed=false
     fi
 
     # Check 6: Package manager status
     echo -e "\n${YELLOW}Checking package manager...${NC}"
-    if ! apt-get update -qq &> /dev/null; then
-        echo -e "${RED}  ❌ Package manager update failed!${NC}"
-        checks_passed=false
-    else
+    if apt-get update -qq &> /dev/null; then
         echo -e "${GREEN}  ✅ Package manager working${NC}"
+        PKG_MANAGER_READY=true
+    else
+        echo -e "${RED}  ❌ Package manager update failed!${NC}"
+        log_message "ERROR" "Package manager update failed"
+        checks_passed=false
     fi
 
     # Check 7: Check if Pi-hole is installed
@@ -430,16 +899,20 @@ pre_flight_check() {
     if command -v pihole &> /dev/null; then
         local pihole_version=$(pihole -v | grep "Pi-hole" | head -1 | cut -d' ' -f4)
         echo -e "${GREEN}  ✅ Pi-hole is installed (version $pihole_version)${NC}"
+        log_message "INFO" "Pi-hole version $pihole_version detected"
     else
         echo -e "${YELLOW}  ⚠️  Pi-hole is not installed - some features may be limited${NC}"
+        log_message "WARNING" "Pi-hole not installed"
     fi
 
     echo -e "\n${BLUE}=== Pre-Flight Summary ===${NC}"
     if [ "$checks_passed" = true ]; then
         echo -e "${GREEN}✅ All critical checks passed!${NC}"
+        log_message "INFO" "Pre-flight checks passed"
         return 0
     else
         echo -e "${RED}❌ Critical checks failed. Please resolve issues and try again.${NC}"
+        log_message "ERROR" "Pre-flight checks failed"
         return 1
     fi
 }
@@ -447,6 +920,12 @@ pre_flight_check() {
 # Install required tools
 install_required_tools() {
     echo -e "\n${BLUE}=== Checking Required Tools ===${NC}"
+    log_message "INFO" "Checking required tools"
+
+    if [ "$PKG_MANAGER_READY" = false ]; then
+        echo -e "${RED}❌ Package manager not ready. Cannot install tools.${NC}"
+        return 1
+    fi
 
     apt-get update -qq
 
@@ -455,22 +934,39 @@ install_required_tools() {
         echo -e "${YELLOW}Installing dselect for rollback functionality...${NC}"
         apt-get install -y dselect
         echo -e "${GREEN}✅ dselect installed${NC}"
+        log_message "INFO" "dselect installed"
     else
         echo -e "${GREEN}✅ dselect already installed${NC}"
     fi
 
-    local tools=("curl" "wget" "git" "dnsutils" "numfmt" "lsb-release" "deborphan" "rfkill" "ethtool" "bc" "lsof")
+    local tools=("curl" "wget" "git" "dnsutils" "numfmt" "lsb-release" "rfkill" "ethtool" "bc" "lsof" "deborphan")
+    local installed_count=0
+
     for tool in "${tools[@]}"; do
         if ! command -v "$tool" &> /dev/null && ! dpkg -l | grep -q "ii  $tool "; then
             echo -e "${YELLOW}Installing $tool...${NC}"
-            apt-get install -y "$tool"
+            if apt-get install -y "$tool"; then
+                echo -e "${GREEN}  ✅ $tool installed${NC}"
+                installed_count=$((installed_count + 1))
+                log_message "INFO" "Installed $tool"
+            else
+                echo -e "${RED}  ❌ Failed to install $tool${NC}"
+                log_message "ERROR" "Failed to install $tool"
+            fi
         fi
     done
+
+    if [ $installed_count -gt 0 ]; then
+        echo -e "${GREEN}✅ Installed $installed_count new tools${NC}"
+    else
+        echo -e "${GREEN}✅ All required tools already installed${NC}"
+    fi
 }
 
 # Verify D-Bus is working
 verify_dbus() {
     echo -e "\n${BLUE}=== Verifying D-Bus System Bus ===${NC}"
+    log_message "INFO" "Verifying D-Bus"
 
     if ! systemctl is-active --quiet dbus; then
         echo -e "${YELLOW}⚠️  D-Bus system bus not running. Attempting to start...${NC}"
@@ -479,8 +975,10 @@ verify_dbus() {
 
         if systemctl is-active --quiet dbus; then
             echo -e "${GREEN}✅ D-Bus started successfully${NC}"
+            log_message "INFO" "D-Bus started"
         else
             echo -e "${RED}❌ Failed to start D-Bus. Some functions may not work.${NC}"
+            log_message "ERROR" "Failed to start D-Bus"
             systemctl start dbus.socket
             sleep 2
             systemctl start dbus
@@ -517,6 +1015,7 @@ get_config_path() {
 # Estimate backup size
 estimate_backup_size() {
     echo -e "\n${BLUE}=== Estimating Backup Size ===${NC}"
+    log_message "INFO" "Estimating backup size"
 
     local total_size=0
 
@@ -554,6 +1053,7 @@ estimate_backup_size() {
     if [ "$available_space_mb" -lt "$required_space_mb" ]; then
         echo -e "${RED}  ❌ Insufficient space for backup!${NC}"
         echo -e "${RED}     Need: ${required_space_mb}MB, Available: ${available_space_mb}MB${NC}"
+        log_message "ERROR" "Insufficient backup space"
         return 1
     else
         echo -e "${GREEN}  ✅ Sufficient space for backup${NC}"
@@ -567,6 +1067,7 @@ create_snapshot() {
     local snapshot_dir="${BACKUP_DIR}/${snapshot_name}"
 
     echo -e "\n${BLUE}=== Creating System Snapshot ===${NC}"
+    log_message "INFO" "Creating snapshot $snapshot_name"
 
     if ! estimate_backup_size; then
         echo -e "${RED}❌ Cannot create snapshot - insufficient space${NC}"
@@ -637,9 +1138,11 @@ create_snapshot() {
     echo "Boot config: $config_path" >> "${snapshot_dir}/snapshot-info.txt"
     echo "Boot mount: $BOOT_PARTITION_MOUNT" >> "${snapshot_dir}/snapshot-info.txt"
 
+    local snapshot_size=$(du -sh "$snapshot_dir" | cut -f1)
     echo -e "${GREEN}✅ Snapshot created: ${snapshot_name}${NC}"
     echo -e "${GREEN}   Location: ${snapshot_dir}${NC}"
-    echo -e "${GREEN}   Size: $(du -sh "$snapshot_dir" | cut -f1)${NC}"
+    echo -e "${GREEN}   Size: ${snapshot_size}${NC}"
+    log_message "INFO" "Snapshot created: $snapshot_name ($snapshot_size)"
 
     CURRENT_BACKUP="$snapshot_name"
 }
@@ -647,6 +1150,7 @@ create_snapshot() {
 # Auto-clean old snapshots (older than SNAPSHOT_RETENTION_DAYS)
 auto_cleanup_snapshots() {
     echo -e "\n${BLUE}=== Auto-Cleaning Old Snapshots ===${NC}"
+    log_message "INFO" "Auto-cleaning snapshots"
 
     if [ ! -d "$BACKUP_DIR" ]; then
         echo -e "${YELLOW}No snapshots directory found.${NC}"
@@ -662,6 +1166,7 @@ auto_cleanup_snapshots() {
             local size=$(du -sh "$snapshot" 2>/dev/null | cut -f1)
             echo -e "  ${YELLOW}→ Removing: $(basename "$snapshot") (${size})${NC}"
             rm -rf "$snapshot"
+            log_message "INFO" "Removed old snapshot: $(basename "$snapshot")"
         done
         echo -e "${GREEN}✅ Old snapshots cleaned up${NC}"
     else
@@ -672,6 +1177,7 @@ auto_cleanup_snapshots() {
 # Delete all snapshots immediately
 delete_all_snapshots() {
     echo -e "\n${RED}=== DELETE ALL SNAPSHOTS ===${NC}"
+    log_message "WARNING" "Delete all snapshots initiated"
 
     if [ ! -d "$BACKUP_DIR" ]; then
         echo -e "${YELLOW}No snapshots directory found.${NC}"
@@ -699,6 +1205,7 @@ delete_all_snapshots() {
         echo -e "${YELLOW}Deleting all snapshots...${NC}"
         rm -rf "${BACKUP_DIR:?}"/*
         echo -e "${GREEN}✅ All snapshots deleted successfully${NC}"
+        log_message "INFO" "All snapshots deleted"
     else
         echo -e "${YELLOW}Deletion cancelled${NC}"
     fi
@@ -708,9 +1215,11 @@ delete_all_snapshots() {
 rollback_system() {
     echo -e "\n${PURPLE}=== System Rollback ===${NC}"
     echo -e "${YELLOW}This will restore your system to a previous state${NC}\n"
+    log_message "INFO" "System rollback initiated"
 
     if [ ! -d "$BACKUP_DIR" ]; then
         echo -e "${RED}❌ No backup directory found at $BACKUP_DIR${NC}"
+        log_message "ERROR" "No backup directory"
         return 1
     fi
 
@@ -718,6 +1227,7 @@ rollback_system() {
 
     if [ ${#snapshots[@]} -eq 0 ]; then
         echo -e "${RED}❌ No snapshots found to rollback to${NC}"
+        log_message "ERROR" "No snapshots found"
         return 1
     fi
 
@@ -733,6 +1243,7 @@ rollback_system() {
 
     if [ "$snapshot_choice" = "0" ]; then
         echo -e "${YELLOW}Rollback cancelled${NC}"
+        log_message "INFO" "Rollback cancelled"
         return 0
     fi
 
@@ -765,12 +1276,11 @@ rollback_system() {
     # Perform rollback with atomic operation
     echo -e "${BLUE}Restoring package states...${NC}"
     if [ -f "$snapshot_dir/package-list.txt" ]; then
-        # Clear selections and restore in one logical block
-        if dpkg --clear-selections && dpkg --set-selections < "$snapshot_dir/package-list.txt"; then
+        if retry_operation "dpkg --clear-selections && dpkg --set-selections < '$snapshot_dir/package-list.txt'" "Restoring package selections"; then
             echo -e "${GREEN}✅ Package selections restored successfully${NC}"
 
             echo -e "${BLUE}Applying package changes (this may take a while)...${NC}"
-            if apt-get dselect-upgrade -y; then
+            if retry_operation "apt-get dselect-upgrade -y" "Applying package changes"; then
                 echo -e "${GREEN}✅ Package states restored successfully${NC}"
             else
                 echo -e "${RED}❌ Some packages may not have restored correctly${NC}"
@@ -816,6 +1326,7 @@ rollback_system() {
 
     echo -e "${GREEN}✅ Rollback completed${NC}"
     echo -e "${YELLOW}⚠️  A system reboot is REQUIRED to complete rollback${NC}"
+    log_message "INFO" "Rollback completed, reboot required"
 
     # Reboot countdown with timeout
     echo -e "\n${YELLOW}System will reboot automatically in $REBOOT_TIMEOUT seconds...${NC}"
@@ -834,6 +1345,7 @@ rollback_system() {
 # Setup automated Pi-hole updates
 setup_pihole_updates() {
     echo -e "\n${BLUE}=== Pi-hole Automated Updates Setup ===${NC}"
+    log_message "INFO" "Setting up Pi-hole updates"
 
     echo -e "${YELLOW}Choose update frequency:${NC}"
     echo "1. Daily (at 3:00 AM)"
@@ -866,6 +1378,7 @@ setup_pihole_updates() {
             echo -e "${YELLOW}Removing Pi-hole update cron job...${NC}"
             crontab -l 2>/dev/null | grep -v "pihole updateGravity" | crontab -
             echo -e "${GREEN}✅ Automated updates disabled${NC}"
+            log_message "INFO" "Auto-updates disabled"
             return 0
             ;;
         0)
@@ -887,6 +1400,7 @@ setup_pihole_updates() {
     echo -e "${GREEN}✅ Pi-hole updates scheduled ${FREQ_TEXT}${NC}"
     echo -e "${GREEN}   Schedule: $CRON_SCHEDULE${NC}"
     echo -e "${YELLOW}   Logs: /var/log/pihole-auto-update.log${NC}"
+    log_message "INFO" "Updates scheduled: $FREQ_TEXT - $CRON_SCHEDULE"
 
     crontab -l | grep "pihole updateGravity"
 }
@@ -895,7 +1409,7 @@ setup_pihole_updates() {
 quick_system_info() {
     echo -e "\n${BLUE}=== Quick System Information ===${NC}"
     echo -e "${GREEN}Hostname:${NC} $(hostname)"
-    echo -e "${GREEN}OS:${NC} $DETECTED_DISTRO $DETECTED_VERSION"
+    echo -e "${GREEN}OS:${NC} $DETECTED_DISTRO $DETECTED_VERSION ($DETECTED_CODENAME)"
     echo -e "${GREEN}Kernel:${NC} $(uname -r)"
     echo -e "${GREEN}Uptime:${NC} $(uptime -p)"
     echo -e "${GREEN}Memory:${NC} $(free -h | awk '/^Mem:/ {print $3"/"$2}')"
@@ -915,12 +1429,14 @@ quick_system_info() {
     if command -v pihole &> /dev/null; then
         echo -e "${GREEN}Pi-hole:${NC} $(pihole status | head -1)"
         echo -e "${GREEN}Pi-hole Version:${NC} $(pihole -v | grep "Pi-hole" | head -1 | cut -d' ' -f4)"
+        echo -e "${GREEN}Blocked Today:${NC} $(pihole -c -j 2>/dev/null | grep -o '"ads_blocked_today":[0-9]*' | cut -d':' -f2 || echo "N/A")"
     else
         echo -e "${YELLOW}Pi-hole:${NC} Not installed"
     fi
 
     echo -e "${GREEN}D-Bus:${NC} $(systemctl is-active dbus)"
     echo -e "${GREEN}Failed Services:${NC} $(systemctl --failed | grep -c "loaded failed" || echo "0")"
+    echo -e "${GREEN}deborphan:${NC} $([ "$DEBORPHAN_AVAILABLE" = true ] && echo "Available" || echo "Not available (using fallback)")"
 
     # Show backup stats
     if [ -d "$BACKUP_DIR" ]; then
@@ -932,11 +1448,14 @@ quick_system_info() {
     # Show processes using /tmp
     local tmp_processes=$(lsof /tmp 2>/dev/null | grep -v "COMMAND" | wc -l)
     echo -e "${GREEN}Processes using /tmp:${NC} $tmp_processes"
+
+    log_message "INFO" "Quick system info displayed"
 }
 
 # View system health
 view_system_health() {
     echo -e "\n${BLUE}=== System Health Report ===${NC}"
+    log_message "INFO" "Viewing system health"
 
     echo -e "\n${YELLOW}D-Bus Status:${NC}"
     systemctl status dbus --no-pager | head -3
@@ -945,10 +1464,13 @@ view_system_health() {
     systemctl --failed --no-pager || echo "None"
 
     echo -e "\n${YELLOW}Recent System Errors:${NC}"
-    journalctl -p 3 -b --no-pager | tail -5
+    journalctl -p 3 -b --no-pager | tail -10
 
     echo -e "\n${YELLOW}Disk Health:${NC}"
     df -h | grep -E "^/dev|Filesystem"
+
+    echo -e "\n${YELLOW}Memory Usage:${NC}"
+    free -h
 
     echo -e "\n${YELLOW}Processes Using /tmp:${NC}"
     lsof /tmp 2>/dev/null | head -20 || echo "None"
@@ -967,11 +1489,15 @@ view_system_health() {
         echo -e "\n${YELLOW}Pi-hole Query Log Stats:${NC}"
         pihole -c -j 2>/dev/null | grep -E "total_queries|blocked_queries" || echo "Unable to get stats"
     fi
+
+    echo -e "\n${YELLOW}Last 10 System Log Entries:${NC}"
+    tail -10 "$LOG_FILE" 2>/dev/null || echo "No log entries"
 }
 
 # Fix D-Bus
 fix_dbus() {
     echo -e "\n${BLUE}=== D-Bus Repair Utility ===${NC}"
+    log_message "INFO" "Attempting D-Bus repair"
 
     echo -e "${YELLOW}Current D-Bus status:${NC}"
     systemctl status dbus --no-pager | head -3
@@ -989,6 +1515,7 @@ fix_dbus() {
 
     if systemctl is-active --quiet dbus; then
         echo -e "${GREEN}✅ D-Bus is now running${NC}"
+        log_message "INFO" "D-Bus fixed"
     else
         echo -e "${RED}❌ D-Bus still not running. Trying emergency fix...${NC}"
         dbus-daemon --system --fork
@@ -1004,6 +1531,7 @@ cleanup_only() {
     echo -e "\n${BLUE}=== Safe Cleanup Mode ===${NC}"
     echo -e "${YELLOW}This will clean temporary files and logs${NC}"
     echo -e "${YELLOW}No system changes will be made${NC}\n"
+    log_message "INFO" "Starting cleanup only"
 
     read -p "Proceed with safe cleanup? (y/N): " -n 1 -r
     echo
@@ -1026,11 +1554,13 @@ cleanup_only() {
     echo -e "${GREEN}✅ Safe cleanup completed${NC}"
     echo -e "Disk space before: $before_space"
     echo -e "Disk space after: $after_space"
+    log_message "INFO" "Cleanup completed, freed space"
 }
 
 # Verify packages
 verify_packages() {
     echo -e "\n${BLUE}=== Verifying critical packages ===${NC}"
+    log_message "INFO" "Verifying packages"
 
     local critical_pkgs=(
         "ca-certificates"
@@ -1085,9 +1615,14 @@ verify_packages() {
             apt update
             for pkg in "${missing_pkgs[@]}"; do
                 echo "Installing $pkg..."
-                apt install -y "$pkg"
+                if apt install -y "$pkg"; then
+                    echo -e "${GREEN}  ✅ $pkg installed${NC}"
+                else
+                    echo -e "${RED}  ❌ Failed to install $pkg${NC}"
+                fi
             done
-            echo -e "${GREEN}✅ Missing packages installed${NC}"
+            echo -e "${GREEN}✅ Missing packages installation attempted${NC}"
+            log_message "INFO" "Installed missing packages: ${missing_pkgs[*]}"
         fi
     else
         echo -e "${GREEN}✅ All critical packages are installed${NC}"
@@ -1097,6 +1632,7 @@ verify_packages() {
 # Clean up old snapshots (manual)
 cleanup_snapshots() {
     echo -e "\n${BLUE}=== Snapshot Cleanup ===${NC}"
+    log_message "INFO" "Manual snapshot cleanup"
 
     if [ ! -d "$BACKUP_DIR" ]; then
         echo -e "${YELLOW}No snapshots directory found.${NC}"
@@ -1135,6 +1671,7 @@ cleanup_snapshots() {
             if [ "$confirm" = "yes" ]; then
                 rm -rf "${BACKUP_DIR:?}"/*
                 echo -e "${GREEN}✅ All snapshots removed${NC}"
+                log_message "INFO" "All snapshots removed"
             fi
             ;;
         2)
@@ -1144,6 +1681,7 @@ cleanup_snapshots() {
             local after_count=$(ls -1 "$BACKUP_DIR" 2>/dev/null | wc -l)
             local removed=$((before_count - after_count))
             echo -e "${GREEN}✅ Removed $removed old snapshot(s)${NC}"
+            log_message "INFO" "Removed $removed old snapshots"
             ;;
         3)
             if [ ${#snapshots[@]} -gt 1 ]; then
@@ -1154,6 +1692,7 @@ cleanup_snapshots() {
                     fi
                 done
                 echo -e "${GREEN}✅ Kept only: $latest${NC}"
+                log_message "INFO" "Kept only latest snapshot: $latest"
             else
                 echo -e "${YELLOW}Only one snapshot exists, nothing to remove${NC}"
             fi
@@ -1166,6 +1705,7 @@ cleanup_snapshots() {
                     snapshot="${snapshots[$((idx-1))]}"
                     rm -rf "${BACKUP_DIR}/$snapshot"
                     echo -e "${GREEN}✅ Removed: $snapshot${NC}"
+                    log_message "INFO" "Removed snapshot: $snapshot"
                 fi
             done
             ;;
@@ -1186,11 +1726,12 @@ dry_run_optimization() {
     echo -e "\n${BLUE}=== DRY RUN MODE - Optimization Preview ===${NC}"
     echo -e "${YELLOW}This will show what would be removed without making any changes${NC}\n"
     echo -e "${GREEN}Log file: $DRY_RUN_LOG${NC}\n"
+    log_message "INFO" "Dry run started"
 
     # Initialize log file
     echo "Pi-hole Ultra Script - Dry Run Report" > "$DRY_RUN_LOG"
     echo "Generated: $(date)" >> "$DRY_RUN_LOG"
-    echo "System: $DETECTED_DISTRO $DETECTED_VERSION" >> "$DRY_RUN_LOG"
+    echo "System: $DETECTED_DISTRO $DETECTED_VERSION ($DETECTED_CODENAME)" >> "$DRY_RUN_LOG"
     echo "================================================" >> "$DRY_RUN_LOG"
     echo "" >> "$DRY_RUN_LOG"
 
@@ -1204,25 +1745,47 @@ dry_run_optimization() {
     # Show orphaned packages that would be removed
     echo -e "${PURPLE}Packages that would be removed (orphaned):${NC}"
     echo "Packages that would be removed (orphaned):" >> "$DRY_RUN_LOG"
-    local orphans=$(deborphan)
-    local orphan_count=0
-    if [ -n "$orphans" ]; then
-        echo "$orphans" | while read pkg; do
-            echo -e "  ${YELLOW}→ $pkg${NC}"
-            echo "  → $pkg" >> "$DRY_RUN_LOG"
-            orphan_count=$((orphan_count + 1))
-        done
-    else
-        echo -e "  ${GREEN}None found${NC}"
-        echo "  None found" >> "$DRY_RUN_LOG"
-    fi
-    echo -e "${GREEN}Total orphaned packages: $orphan_count${NC}\n"
-    echo "Total orphaned packages: $orphan_count" >> "$DRY_RUN_LOG"
-    echo "" >> "$DRY_RUN_LOG"
 
-    # Show services that would be disabled (non-essential)
-    echo -e "${PURPLE}Services that would be analyzed for disabling:${NC}"
-    echo "Services that would be analyzed for disabling:" >> "$DRY_RUN_LOG"
+    if command -v deborphan &> /dev/null; then
+        local orphans=$(deborphan)
+        local dev_orphans=$(deborphan --guess-dev 2>/dev/null)
+        local data_orphans=$(deborphan --guess-data 2>/dev/null)
+
+        if [ -n "$orphans" ]; then
+            echo "$orphans" | while read pkg; do
+                local size=$(get_package_size "$pkg")
+                echo -e "  ${YELLOW}→ $pkg ($(numfmt --to=iec ${size}K))${NC}"
+                echo "  → $pkg ($(numfmt --to=iec ${size}K))" >> "$DRY_RUN_LOG"
+            done
+        fi
+        if [ -n "$dev_orphans" ]; then
+            echo "$dev_orphans" | while read pkg; do
+                local size=$(get_package_size "$pkg")
+                echo -e "  ${YELLOW}→ $pkg [dev] ($(numfmt --to=iec ${size}K))${NC}"
+                echo "  → $pkg [dev] ($(numfmt --to=iec ${size}K))" >> "$DRY_RUN_LOG"
+            done
+        fi
+        if [ -n "$data_orphans" ]; then
+            echo "$data_orphans" | while read pkg; do
+                local size=$(get_package_size "$pkg")
+                echo -e "  ${YELLOW}→ $pkg [data] ($(numfmt --to=iec ${size}K))${NC}"
+                echo "  → $pkg [data] ($(numfmt --to=iec ${size}K))" >> "$DRY_RUN_LOG"
+            done
+        fi
+    else
+        local autoremove=$(apt-get autoremove --dry-run 2>/dev/null | grep "^Remv" | awk '{print $2}')
+        if [ -n "$autoremove" ]; then
+            echo "$autoremove" | while read pkg; do
+                local size=$(get_package_size "$pkg")
+                echo -e "  ${YELLOW}→ $pkg (autoremovable) ($(numfmt --to=iec ${size}K))${NC}"
+                echo "  → $pkg (autoremovable) ($(numfmt --to=iec ${size}K))" >> "$DRY_RUN_LOG"
+            done
+        fi
+    fi
+
+    # Show services that would be analyzed for disabling
+    echo -e "\n${PURPLE}Services that would be analyzed for disabling:${NC}"
+    echo "\nServices that would be analyzed for disabling:" >> "$DRY_RUN_LOG"
     local services_to_check=(
         "bluetooth"
         "hciuart"
@@ -1307,6 +1870,7 @@ dry_run_optimization() {
     echo "" >> "$DRY_RUN_LOG"
     echo "================================================" >> "$DRY_RUN_LOG"
     echo "Dry run completed - no changes were made" >> "$DRY_RUN_LOG"
+    log_message "INFO" "Dry run completed"
 
     # Offer to view the log
     echo ""
@@ -1320,6 +1884,7 @@ dry_run_optimization() {
 # Reinstall Raspberry Pi specific components
 reinstall_rpi_components() {
     echo -e "\n${BLUE}=== Raspberry Pi Component Reinstallation ===${NC}"
+    log_message "INFO" "RPi component reinstallation"
 
     if [ "$IS_RASPBERRY_PI" = false ]; then
         echo -e "${RED}❌ This is not a Raspberry Pi. This option is only for Raspberry Pi hardware.${NC}"
@@ -1350,23 +1915,23 @@ reinstall_rpi_components() {
 
     # Reinstall kernel and firmware
     echo -e "${YELLOW}Reinstalling Raspberry Pi kernel...${NC}"
-    apt install --reinstall -y raspberrypi-kernel raspberrypi-bootloader
+    retry_operation "apt install --reinstall -y raspberrypi-kernel raspberrypi-bootloader" "Kernel reinstall"
 
     echo -e "${YELLOW}Reinstalling firmware...${NC}"
-    apt install --reinstall -y raspberrypi-sys-mods raspi-config raspi-utils
+    retry_operation "apt install --reinstall -y raspberrypi-sys-mods raspi-config raspi-utils" "Firmware reinstall"
 
     echo -e "${YELLOW}Reinstalling VideoCore libraries...${NC}"
-    apt install --reinstall -y libraspberrypi-bin libraspberrypi-dev libraspberrypi-doc libraspberrypi0
+    retry_operation "apt install --reinstall -y libraspberrypi-bin libraspberrypi-dev libraspberrypi-doc libraspberrypi0" "VideoCore reinstall"
 
     echo -e "${YELLOW}Updating EEPROM...${NC}"
-    apt install --reinstall -y rpi-eeprom
-    rpi-eeprom-update -a
+    retry_operation "apt install --reinstall -y rpi-eeprom && rpi-eeprom-update -a" "EEPROM update"
 
     echo -e "${YELLOW}Reconfiguring raspi-config...${NC}"
     dpkg-reconfigure raspi-config
 
     echo -e "${GREEN}✅ Raspberry Pi components reinstalled${NC}"
     echo -e "${YELLOW}⚠️  A reboot is recommended to apply changes${NC}"
+    log_message "INFO" "RPi components reinstalled"
 
     # Reboot countdown with timeout
     echo -e "\n${YELLOW}System will reboot automatically in $REBOOT_TIMEOUT seconds...${NC}"
@@ -1425,6 +1990,7 @@ show_optimization_summary() {
     fi
 
     echo -e "${GREEN}═══════════════════════════════════════════════════════════════════${NC}"
+    log_message "INFO" "Optimization summary displayed"
 }
 
 # Full Optimization with Bloat Removal
@@ -1433,7 +1999,7 @@ run_full_optimization() {
     echo -e "${YELLOW}This process will:${NC}"
     echo -e "  1. Auto-clean snapshots older than $SNAPSHOT_RETENTION_DAYS days"
     echo -e "  2. Create a system snapshot (backup)"
-    echo -e "  3. Remove orphaned packages (with confirmation)"
+    echo -e "  3. Remove orphaned packages (with smart detection)"
     echo -e "  4. Disable unnecessary services"
     echo -e "  5. Apply system optimizations (with smart boot config detection)"
     echo -e "  6. Clean temporary files and logs (with process check)"
@@ -1441,6 +2007,7 @@ run_full_optimization() {
     echo -e "  8. Optimize Pi-hole"
     echo -e "  9. Auto-reboot after $REBOOT_TIMEOUT seconds if no response"
     echo ""
+    log_message "INFO" "Starting full optimization"
 
     read -p "Proceed with full optimization? (y/N): " -n 1 -r
     echo
@@ -1469,32 +2036,23 @@ run_full_optimization() {
         return 1
     fi
 
-    # Step 3: Remove orphaned packages with confirmation
+    # Step 3: Check for orphaned packages
     echo -e "\n${YELLOW}Step 3: Checking for orphaned packages...${NC}"
-    local orphans=$(deborphan)
-    local removed_count=0
-    if [ -n "$orphans" ]; then
-        echo -e "${PURPLE}The following orphaned packages were found:${NC}"
-        echo "$orphans" | while read pkg; do
-            echo -e "  ${YELLOW}→ $pkg${NC}"
-        done
-        echo ""
-        read -p "Remove these orphaned packages? (y/N): " -n 1 -r
-        echo
-        if [[ $REPLY =~ ^[Yy]$ ]]; then
-            removed_count=$(echo "$orphans" | wc -l)
-            echo "$orphans" | xargs apt-get remove --purge -y
-            echo "Removed $removed_count" >> "$OPTIMIZATION_STATS_FILE"
-            echo -e "${GREEN}✅ Orphaned packages removed${NC}"
-        else
-            echo -e "${YELLOW}⚠️  Skipping orphaned package removal${NC}"
-        fi
+    check_orphaned_packages
+
+    # Step 4: Remove orphaned packages (optional)
+    echo ""
+    read -p "Do you want to remove orphaned packages? (y/N): " -n 1 -r
+    echo
+    if [[ $REPLY =~ ^[Yy]$ ]]; then
+        remove_orphaned_packages
+        echo "Removed packages" >> "$OPTIMIZATION_STATS_FILE"
     else
-        echo -e "${GREEN}✅ No orphaned packages found${NC}"
+        echo -e "${YELLOW}⚠️  Skipping orphaned package removal${NC}"
     fi
 
-    # Step 4: Disable unnecessary services
-    echo -e "\n${YELLOW}Step 4: Disabling unnecessary services...${NC}"
+    # Step 5: Disable unnecessary services
+    echo -e "\n${YELLOW}Step 5: Disabling unnecessary services...${NC}"
     local services_to_disable=(
         "bluetooth"
         "hciuart"
@@ -1531,9 +2089,9 @@ run_full_optimization() {
     done
     echo "Disabled $disabled_count" >> "$OPTIMIZATION_STATS_FILE"
 
-    # Step 5: Raspberry Pi specific optimizations (using smart boot config)
+    # Step 6: Raspberry Pi specific optimizations
     if [ "$IS_RASPBERRY_PI" = true ]; then
-        echo -e "\n${YELLOW}Step 5: Applying Raspberry Pi optimizations...${NC}"
+        echo -e "\n${YELLOW}Step 6: Applying Raspberry Pi optimizations...${NC}"
 
         # Re-detect boot config to ensure we have the latest
         detect_boot_config
@@ -1589,8 +2147,8 @@ run_full_optimization() {
         fi
     fi
 
-    # Step 6: Cleaning system (with process check)
-    echo -e "\n${YELLOW}Step 6: Cleaning system...${NC}"
+    # Step 7: Cleaning system (with process check)
+    echo -e "\n${YELLOW}Step 7: Cleaning system...${NC}"
     apt autoremove --purge -y
     apt autoclean -y
     apt clean
@@ -1600,14 +2158,14 @@ run_full_optimization() {
     safe_cleanup
     echo -e "${GREEN}✅ System cleaned${NC}"
 
-    # Step 7: Update system
-    echo -e "\n${YELLOW}Step 7: Updating system packages...${NC}"
+    # Step 8: Update system
+    echo -e "\n${YELLOW}Step 8: Updating system packages...${NC}"
     apt update
     apt upgrade -y
     echo -e "${GREEN}✅ System updated${NC}"
 
-    # Step 8: Optimize Pi-hole
-    echo -e "\n${YELLOW}Step 8: Optimizing Pi-hole...${NC}"
+    # Step 9: Optimize Pi-hole
+    echo -e "\n${YELLOW}Step 9: Optimizing Pi-hole...${NC}"
     pihole updateGravity
     pihole -up
     echo -e "${GREEN}✅ Pi-hole optimized${NC}"
@@ -1624,6 +2182,7 @@ run_full_optimization() {
 
     echo -e "\n${GREEN}✅ Full optimization completed successfully!${NC}"
     echo -e "${YELLOW}⚠️  A system reboot is recommended to apply all changes${NC}"
+    log_message "INFO" "Full optimization completed"
 
     # Reboot countdown with timeout
     echo -e "\n${YELLOW}System will reboot automatically in $REBOOT_TIMEOUT seconds...${NC}"
@@ -1663,15 +2222,18 @@ show_menu() {
     echo -e "${CYAN}║${NC} 11. Cleanup Only (with process check)                        ${CYAN}║${NC}"
     echo -e "${CYAN}║${NC} 12. Cleanup Old Snapshots (manual)                           ${CYAN}║${NC}"
     echo -e "${CYAN}║${NC} 13. DELETE ALL SNAPSHOTS (dangerous)                         ${CYAN}║${NC}"
+    echo -e "${CYAN}║${NC} 14. Check Orphaned Packages Only                             ${CYAN}║${NC}"
     echo -e "${CYAN}║${NC} 0.  Exit                                                     ${CYAN}║${NC}"
     echo -e "${CYAN}╠══════════════════════════════════════════════════════════════╣${NC}"
     echo -e "${CYAN}║${NC} System: $DETECTED_DISTRO $DETECTED_VERSION"
+    echo -e "${CYAN}║${NC} Codename: $DETECTED_CODENAME"
     if [ "$IS_RASPBERRY_PI" = true ]; then
         echo -e "${CYAN}║${NC} Hardware: $RPI_MODEL"
         echo -e "${CYAN}║${NC} Boot Config: $BOOT_CONFIG_PATH"
     fi
     echo -e "${CYAN}║${NC} Network: $ACTIVE_INTERFACE ($([ "$IS_WIFI_ACTIVE" = true ] && echo "WiFi" || echo "Ethernet"))"
     echo -e "${CYAN}║${NC} Auto-cleanup: Snapshots > ${SNAPSHOT_RETENTION_DAYS} days | Auto-reboot: ${REBOOT_TIMEOUT}s"
+    echo -e "${CYAN}║${NC} deborphan: $([ "$DEBORPHAN_AVAILABLE" = true ] && echo "Available" || echo "Fallback mode")"
     if [ -d "$BACKUP_DIR" ]; then
         local snapshot_count=$(ls -1 "$BACKUP_DIR" 2>/dev/null | wc -l)
         local tmp_processes=$(lsof /tmp 2>/dev/null | grep -v "COMMAND" | wc -l)
@@ -1679,7 +2241,7 @@ show_menu() {
     fi
     echo -e "${CYAN}╚══════════════════════════════════════════════════════════════╝${NC}"
     echo ""
-    read -p "Enter your choice [0-13]: " MENU_CHOICE
+    read -p "Enter your choice [0-14]: " MENU_CHOICE
 }
 
 # ============== MAIN EXECUTION ==============
@@ -1689,9 +2251,11 @@ main() {
     clear
     show_banner
     echo -e "${BLUE}Starting Pre-Flight Checks...${NC}\n"
+    log_message "INFO" "Script started"
 
     if ! pre_flight_check; then
         echo -e "\n${RED}❌ Pre-flight checks failed. Please resolve issues and try again.${NC}"
+        log_message "ERROR" "Pre-flight checks failed"
         read -p "Press Enter to exit..."
         exit 1
     fi
@@ -1699,6 +2263,9 @@ main() {
     install_required_tools
     verify_dbus
     mkdir -p "$BACKUP_DIR"
+
+    # Check deborphan availability
+    check_deborphan_availability
 
     # Show info screen on first run
     SCRIPT_RUN_COUNT=1
@@ -1760,6 +2327,10 @@ main() {
                 delete_all_snapshots
                 read -p "Press Enter to continue..."
                 ;;
+            14)
+                check_orphaned_packages
+                read -p "Press Enter to continue..."
+                ;;
             0)
                 echo -e "\n${GREEN}══════════════════════════════════════════════════════════════${NC}"
                 echo -e "${GREEN}Thank you for using Pi-hole Debian Ultra Script!${NC}"
@@ -1773,11 +2344,14 @@ main() {
                 echo -e "${CYAN}  \"A stable Pi-hole keeps the internet peaceful!\"${NC}"
                 echo -e "${CYAN}  \"Smart boot config detection for perfect compatibility!\"${NC}"
                 echo -e "${CYAN}  \"Dry Run logs let you review before committing!\"${NC}"
+                echo -e "${CYAN}  \"deborphan detection works on Debian 13+ (Trixie)!\"${NC}"
                 echo -e "${CYAN}══════════════════════════════════════════════════════════════${NC}"
+                log_message "INFO" "Script exited normally"
 
                 # Clean up temp files
                 rm -f "$OPTIMIZATION_STATS_FILE" 2>/dev/null
                 rm -f "$TEMP_SELECTIONS"* 2>/dev/null
+                rm -f /tmp/pihole-*.tmp 2>/dev/null
                 exit 0
                 ;;
             *)
