@@ -1,8 +1,8 @@
-# **🛡️ Pi-hole Debian 12 Ultra Script**
+# **🛡️ Raspberry Pi Ultra Script**
 
-**Pi-hole Debian 12 Ultra Script** is a comprehensive system optimization and maintenance suite specifically designed for Raspberry Pi units running **Debian 12 (Bookworm)**. Unlike basic cleanup scripts, "Ultra" focuses on stability, hardware safety, and easy recovery.
+**Unlike basic cleanup scripts, "Ultra" focuses on stability, hardware safety, and easy recovery.
 
-Developed by [Wael Isa](file:///opt/onlyoffice/desktopeditors/editors/web-apps/apps/documenteditor/main/index.html?_dc=0&lang=en-US&type=desktop&frameEditorId=placeholder&isForm=false&parentOrigin=file://&fileType=docx).
+Developed by [Wael Isa](https://github.com/waelisa).
 
 ## **✨ Key Features**
 
