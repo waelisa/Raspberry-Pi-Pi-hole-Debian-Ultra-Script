@@ -5,7 +5,7 @@
 # Author:  Wael Isa
 # Website: https://www.wael.name
 # GitHub:  https://github.com/waelisa/Raspberry-Pi-Pi-hole-Debian-Ultra-Script
-# Version: 2.1.9
+# Version: 2.2.1
 # License: MIT
 #
 # Description: Complete system optimization script for systems running
@@ -13,15 +13,13 @@
 #              snapshots, rollback capability, and automated updates.
 #              Compatible with Raspberry Pi and other Debian installations.
 #
-# NEW IN v2.1.9:
-#   • Fixed deborphan detection (handles Debian 13+ where package was removed)
-#   • Fallback orphan detection methods for all Debian versions
-#   • Enhanced error recovery with automatic retry
-#   • Detailed orphaned package analysis with size estimation
-#   • Smart autoremove preview with space savings calculation
-#   • Improved logging with timestamps
-#   • Package removal safety checks
-#   • System health monitoring after operations
+# NEW IN v2.2.1:
+#   • Removed deborphan completely (phased out in Debian 13+)
+#   • Native apt orphan detection using apt-mark and apt autoremove
+#   • New cleanup_system() function for standardized maintenance
+#   • Simplified package installation (no more deborphan errors)
+#   • Better compatibility with Debian 13 (Trixie) and newer
+#   • Faster orphan detection using native tools
 #
 # "A stable Pi-hole keeps the internet peaceful!"
 #
@@ -31,7 +29,7 @@
 # ============== CONFIGURATION ==============
 LOG_FILE="/var/log/pihole-ultra.log"
 BACKUP_DIR="/root/pihole-system-backups"
-SCRIPT_VERSION="2.1.9"
+SCRIPT_VERSION="2.2.1"
 MIN_DISK_SPACE_MB=500  # Minimum 500MB free space required
 MIN_MEMORY_MB=256      # Minimum 256MB free memory recommended
 SNAPSHOT_RETENTION_DAYS=14  # Automatically remove snapshots older than this
@@ -79,7 +77,6 @@ START_DISK_USED=$(df / | awk 'NR==2 {print $3}')
 SCRIPT_RUN_COUNT=0
 BOOT_CONFIG_PATH=""
 BOOT_PARTITION_MOUNT=""
-DEBORPHAN_AVAILABLE=false
 PKG_MANAGER_READY=false
 
 # ============== INITIAL CHECKS ==============
@@ -138,9 +135,9 @@ show_script_info() {
     echo -e "${CYAN}║${NC}                                                                  ${CYAN}║${NC}"
     echo -e "${CYAN}║${NC} 1. Creating system snapshots (backup) before any changes     ${CYAN}║${NC}"
     echo -e "${CYAN}║${NC} 2. Auto-cleaning snapshots older than ${SNAPSHOT_RETENTION_DAYS} days          ${CYAN}║${NC}"
-    echo -e "${CYAN}║${NC} 3. Removing unnecessary packages with smart detection          ${CYAN}║${NC}"
-    echo -e "${CYAN}║${NC}    • Uses deborphan if available                               ${CYAN}║${NC}"
-    echo -e "${CYAN}║${NC}    • Fallback methods for Debian 13+ (Trixie)                  ${CYAN}║${NC}"
+    echo -e "${CYAN}║${NC} 3. Removing unnecessary packages with native apt detection     ${CYAN}║${NC}"
+    echo -e "${CYAN}║${NC}    • Uses apt-mark to find orphaned packages                  ${CYAN}║${NC}"
+    echo -e "${CYAN}║${NC}    • Native apt autoremove for safe cleanup                   ${CYAN}║${NC}"
     echo -e "${CYAN}║${NC}    • Shows space savings before removal                         ${CYAN}║${NC}"
     echo -e "${CYAN}║${NC} 4. Disabling non-essential services                           ${CYAN}║${NC}"
     echo -e "${CYAN}║${NC} 5. Optimizing system for Pi-hole performance                  ${CYAN}║${NC}"
@@ -170,7 +167,7 @@ show_script_info() {
     echo -e "  • Debian 10 (Buster) - Full support"
     echo -e "  • Debian 11 (Bullseye) - Full support"
     echo -e "  • Debian 12 (Bookworm) - Full support"
-    echo -e "  • Debian 13 (Trixie) - Fallback orphan detection"
+    echo -e "  • Debian 13 (Trixie) - Native apt orphan detection"
     echo -e "  • Raspberry Pi OS (all versions)"
     echo -e "  • Ubuntu 20.04 LTS and 22.04 LTS"
     echo ""
@@ -425,50 +422,7 @@ detect_boot_config() {
     return 1
 }
 
-# ============== IMPROVED ORPHANED PACKAGE HANDLING ==============
-check_deborphan_availability() {
-    echo -e "\n${BLUE}=== Checking deborphan Availability ===${NC}"
-    log_message "INFO" "Checking deborphan availability"
-
-    DEBORPHAN_AVAILABLE=false
-
-    # Check if deborphan is installed
-    if command -v deborphan &> /dev/null; then
-        DEBORPHAN_AVAILABLE=true
-        local version=$(deborphan --version 2>/dev/null | head -1)
-        echo -e "${GREEN}✅ deborphan is installed - Version: $version${NC}"
-        log_message "INFO" "deborphan installed"
-        return 0
-    fi
-
-    # Check if it's available in repositories
-    if apt-cache show deborphan &> /dev/null; then
-        local version=$(apt-cache policy deborphan | grep Candidate | awk '{print $2}')
-        echo -e "${YELLOW}⚠️  deborphan is not installed but available (version $version)${NC}"
-        log_message "INFO" "deborphan available in repos"
-
-        read -p "   Install deborphan now? (y/N): " -n 1 -r
-        echo
-        if [[ $REPLY =~ ^[Yy]$ ]]; then
-            echo -e "${YELLOW}Installing deborphan...${NC}"
-            if apt-get install -y deborphan; then
-                DEBORPHAN_AVAILABLE=true
-                echo -e "${GREEN}✅ deborphan installed successfully${NC}"
-                log_message "INFO" "deborphan installed"
-                return 0
-            else
-                echo -e "${RED}❌ Failed to install deborphan${NC}"
-                log_message "ERROR" "Failed to install deborphan"
-            fi
-        fi
-    else
-        echo -e "${YELLOW}⚠️  deborphan is not available in your repositories${NC}"
-        echo -e "${YELLOW}   This is normal on Debian 13+ (Trixie) and newer systems${NC}"
-        log_message "INFO" "deborphan not in repos - using fallback"
-    fi
-
-    return 1
-}
+# ============== NATIVE APT ORPHAN DETECTION (NO DEBORPHAN) ==============
 
 # Calculate size of packages before removal
 get_package_size() {
@@ -507,58 +461,31 @@ preview_package_removal() {
     return $total_size
 }
 
-# Fallback method using apt and dpkg (works on all systems)
-find_orphaned_packages_fallback() {
-    echo -e "\n${YELLOW}Using fallback method to find orphaned packages...${NC}"
-    echo -e "${YELLOW}This method works on all Debian versions including 13+ (Trixie).${NC}"
-    log_message "INFO" "Using fallback orphan detection"
+# Native apt orphan detection (works on all Debian versions)
+check_orphaned_packages() {
+    echo -e "\n${BLUE}=== Checking for Orphaned Packages (Native apt) ===${NC}"
+    log_message "INFO" "Starting orphaned package check using native apt"
 
     local total_found=0
-    local autoremove_list=""
-    local manual_orphans=""
 
     # Method 1: Use apt autoremove --dry-run to see what would be removed
     echo -e "\n${PURPLE}1. Packages that 'apt autoremove' would remove:${NC}"
-    autoremove_list=$(apt-get autoremove --dry-run 2>/dev/null | grep "^Remv" | awk '{print $2}')
+    local autoremove_list=$(apt-get autoremove --dry-run 2>/dev/null | grep "^Remv" | awk '{print $2}')
 
     if [ -n "$autoremove_list" ]; then
         preview_package_removal "$autoremove_list"
         total_found=$((total_found + $(echo "$autoremove_list" | wc -l)))
+        echo "$autoremove_list" > /tmp/pihole-autoremove.tmp
     else
         echo -e "${GREEN}  ✓ No packages found by autoremove${NC}"
     fi
 
-    # Method 2: Find orphaned libraries (packages with no reverse dependencies)
-    echo -e "\n${PURPLE}2. Checking for orphaned libraries...${NC}"
-    local lib_orphans=""
-    local lib_count=0
-
-    # Check libraries that might be orphaned
-    for lib in $(dpkg -l | grep "^ii.*lib" | awk '{print $2}' | grep -E "^(lib)" | head -50); do
-        # Skip essential libraries
-        if dpkg -s "$lib" 2>/dev/null | grep -q "Essential: yes"; then
-            continue
-        fi
-
-        # Check if any installed package depends on this library
-        local depends=$(apt-cache rdepends --installed "$lib" 2>/dev/null | grep -v "^  " | grep -v "^Reverse Depends" | tail -n +2 | grep -v "lib" | wc -l)
-        if [ "$depends" -eq 0 ]; then
-            lib_orphans="$lib_orphans $lib"
-            lib_count=$((lib_count + 1))
-        fi
-    done
-
-    if [ "$lib_count" -gt 0 ]; then
-        preview_package_removal "$lib_orphans"
-        total_found=$((total_found + lib_count))
-    else
-        echo -e "${GREEN}  ✓ No orphaned libraries found in sample${NC}"
-    fi
-
-    # Method 3: Find packages that are not required by any other package
-    echo -e "\n${PURPLE}3. Checking for manually installed packages without dependents...${NC}"
+    # Method 2: Find manually installed packages with no reverse dependencies
+    echo -e "\n${PURPLE}2. Checking for orphaned libraries using apt-mark...${NC}"
     local orphan_candidates=""
     local candidate_count=0
+
+    # Get all manually installed packages
     local manual_pkgs=$(apt-mark showmanual | grep -v "^lib" | head -30)
 
     for pkg in $manual_pkgs; do
@@ -567,12 +494,12 @@ find_orphaned_packages_fallback() {
             continue
         fi
 
-        # Skip if it's a critical system package
+        # Skip critical system packages
         if echo "$pkg" | grep -E "^(systemd|apt|bash|coreutils|dpkg|grub|linux-image|openssh)" >/dev/null; then
             continue
         fi
 
-        # Check if any installed package depends on this
+        # Check if any installed package depends on this one
         local rdeps=$(apt-cache rdepends --installed "$pkg" 2>/dev/null | grep -v "^  " | grep -v "^Reverse Depends" | tail -n +2 | grep -v "$pkg" | wc -l)
         if [ "$rdeps" -eq 0 ]; then
             orphan_candidates="$orphan_candidates $pkg"
@@ -583,81 +510,69 @@ find_orphaned_packages_fallback() {
     if [ "$candidate_count" -gt 0 ]; then
         preview_package_removal "$orphan_candidates"
         total_found=$((total_found + candidate_count))
+        echo "$orphan_candidates" > /tmp/pihole-candidates.tmp
         echo -e "${YELLOW}Note: These are candidates - verify before removal!${NC}"
     else
         echo -e "${GREEN}  ✓ No orphan candidates found${NC}"
     fi
 
-    echo -e "\n${YELLOW}Total potential orphaned packages found: $total_found${NC}"
-    log_message "INFO" "Fallback detection found $total_found potential orphans"
+    # Method 3: Find packages that were auto-installed but no longer needed
+    echo -e "\n${PURPLE}3. Checking auto-removable packages (apt-mark showauto)...${NC}"
+    local auto_pkgs=$(apt-mark showauto 2>/dev/null | head -30)
+    local auto_removable=""
 
-    # Store results for later removal
-    echo "$autoremove_list" > /tmp/pihole-autoremove.tmp
-    echo "$lib_orphans" > /tmp/pihole-lib-orphans.tmp
-    echo "$orphan_candidates" > /tmp/pihole-candidates.tmp
+    for pkg in $auto_pkgs; do
+        # Check if this package is still required by anything
+        if apt-cache rdepends --installed "$pkg" 2>/dev/null | grep -q "^  [^ ]"; then
+            continue
+        fi
+        auto_removable="$auto_removable $pkg"
+    done
+
+    if [ -n "$auto_removable" ]; then
+        preview_package_removal "$auto_removable"
+        total_found=$((total_found + $(echo "$auto_removable" | wc -l)))
+        echo "$auto_removable" > /tmp/pihole-auto.tmp
+    else
+        echo -e "${GREEN}  ✓ No auto-removable packages found${NC}"
+    fi
+
+    echo -e "\n${GREEN}Total potential orphaned packages found: $total_found${NC}"
+    log_message "INFO" "Native apt detection found $total_found potential orphans"
 
     return $total_found
 }
 
-# Check orphaned packages with deborphan
-check_orphaned_with_deborphan() {
-    echo -e "\n${BLUE}=== Checking for Orphaned Packages (deborphan) ===${NC}"
-    log_message "INFO" "Running deborphan check"
+# Standardized system cleanup function (new in v2.2.1)
+cleanup_system() {
+    echo -e "\n${BLUE}=== Standard System Cleanup ===${NC}"
+    log_message "INFO" "Starting system cleanup"
 
-    local total_orphans=0
-    local orphans=""
+    # Update package database
+    echo -e "${YELLOW}Updating package database...${NC}"
+    apt-get update -qq
 
-    # Standard orphan check
-    orphans=$(deborphan 2>/dev/null)
-    if [ -n "$orphans" ]; then
-        local count=$(echo "$orphans" | wc -l)
-        total_orphans=$((total_orphans + count))
-        echo -e "\n${PURPLE}Standard orphaned packages ($count found):${NC}"
-        preview_package_removal "$orphans"
-    fi
-
-    # Check for development orphans
-    local dev_orphans=$(deborphan --guess-dev 2>/dev/null | head -20)
-    if [ -n "$dev_orphans" ]; then
-        local dev_count=$(echo "$dev_orphans" | wc -l)
-        total_orphans=$((total_orphans + dev_count))
-        echo -e "\n${PURPLE}Development orphaned packages ($dev_count found):${NC}"
-        preview_package_removal "$dev_orphans"
-    fi
-
-    # Check for data orphans
-    local data_orphans=$(deborphan --guess-data 2>/dev/null | head -20)
-    if [ -n "$data_orphans" ]; then
-        local data_count=$(echo "$data_orphans" | wc -l)
-        total_orphans=$((total_orphans + data_count))
-        echo -e "\n${PURPLE}Data orphaned packages ($data_count found):${NC}"
-        preview_package_removal "$data_orphans"
-    fi
-
-    echo -e "\n${GREEN}Total orphaned packages found: $total_orphans${NC}"
-    log_message "INFO" "deborphan found $total_orphans orphans"
-
-    # Store results
-    echo "$orphans" > /tmp/pihole-deborphan.tmp
-    echo "$dev_orphans" > /tmp/pihole-dev-orphans.tmp
-    echo "$data_orphans" > /tmp/pihole-data-orphans.tmp
-
-    return $total_orphans
-}
-
-# Main orphaned package check
-check_orphaned_packages() {
-    echo -e "\n${BLUE}=== Checking for Orphaned Packages ===${NC}"
-    log_message "INFO" "Starting orphaned package check"
-
-    # Check if deborphan is available
-    check_deborphan_availability
-
-    if [ "$DEBORPHAN_AVAILABLE" = true ]; then
-        check_orphaned_with_deborphan
+    # Remove packages that were automatically installed and are no longer needed
+    echo -e "${YELLOW}Removing unused dependencies...${NC}"
+    if apt-get autoremove --purge -y > /dev/null 2>&1; then
+        echo -e "${GREEN}✅ Unused dependencies removed${NC}"
+        log_message "INFO" "Autoremove completed"
     else
-        find_orphaned_packages_fallback
+        echo -e "${YELLOW}⚠️  Standard cleanup skipped or had no packages to remove${NC}"
     fi
+
+    # Clear out the local repository of retrieved package files
+    echo -e "${YELLOW}Cleaning package cache...${NC}"
+    apt-get autoclean -y > /dev/null 2>&1
+    apt-get clean > /dev/null 2>&1
+    echo -e "${GREEN}✅ Package cache cleaned${NC}"
+
+    # Vacuum journal logs
+    echo -e "${YELLOW}Cleaning old system logs...${NC}"
+    journalctl --vacuum-time=7d > /dev/null 2>&1
+    echo -e "${GREEN}✅ Old logs cleaned${NC}"
+
+    log_message "INFO" "System cleanup completed"
 }
 
 # Remove orphaned packages with safety checks
@@ -670,13 +585,12 @@ remove_orphaned_packages() {
 
     echo -e "${PURPLE}Removal Options:${NC}"
     echo "1. Remove autoremove packages only (safest)"
-    echo "2. Remove orphaned libraries (moderate risk)"
-    echo "3. Remove all detected orphans (aggressive)"
-    echo "4. Remove with recursive cleanup (very aggressive)"
-    echo "5. Select packages individually"
-    echo "6. Skip removal"
+    echo "2. Remove all detected orphans (moderate)"
+    echo "3. Run full system cleanup (autoremove + autoclean)"
+    echo "4. Select packages individually"
+    echo "5. Skip removal"
     echo ""
-    read -p "Choose option (1-6): " removal_choice
+    read -p "Choose option (1-5): " removal_choice
 
     case $removal_choice in
         1)
@@ -686,49 +600,20 @@ remove_orphaned_packages() {
             removal_mode="autoremove only"
             ;;
         2)
-            if [ -f /tmp/pihole-lib-orphans.tmp ]; then
-                packages_to_remove=$(cat /tmp/pihole-lib-orphans.tmp)
-            fi
-            removal_mode="orphaned libraries"
-            ;;
-        3)
-            if [ -f /tmp/pihole-autoremove.tmp ]; then
-                packages_to_remove="$packages_to_remove $(cat /tmp/pihole-autoremove.tmp)"
-            fi
-            if [ -f /tmp/pihole-lib-orphans.tmp ]; then
-                packages_to_remove="$packages_to_remove $(cat /tmp/pihole-lib-orphans.tmp)"
-            fi
-            if [ -f /tmp/pihole-candidates.tmp ]; then
-                packages_to_remove="$packages_to_remove $(cat /tmp/pihole-candidates.tmp)"
-            fi
-            if [ -f /tmp/pihole-deborphan.tmp ]; then
-                packages_to_remove="$packages_to_remove $(cat /tmp/pihole-deborphan.tmp)"
-            fi
-            if [ -f /tmp/pihole-dev-orphans.tmp ]; then
-                packages_to_remove="$packages_to_remove $(cat /tmp/pihole-dev-orphans.tmp)"
-            fi
+            # Collect all orphans from temp files
+            for tmp in /tmp/pihole-*.tmp; do
+                if [ -f "$tmp" ]; then
+                    packages_to_remove="$packages_to_remove $(cat "$tmp")"
+                fi
+            done
             removal_mode="all detected orphans"
             ;;
-        4)
-            echo -e "${RED}⚠️  RECURSIVE MODE - This will keep removing until no orphans remain${NC}"
-            echo -e "${YELLOW}This can be very aggressive - make sure you have a backup!${NC}"
-            read -p "Are you absolutely sure? (type 'yes' to confirm): " confirm
-            if [ "$confirm" = "yes" ]; then
-                local loop_count=0
-                while [ "$(deborphan 2>/dev/null | wc -l)" -gt 0 ] && [ $loop_count -lt 10 ]; do
-                    echo -e "${YELLOW}Pass $((loop_count+1)): Removing orphans...${NC}"
-                    deborphan 2>/dev/null | xargs apt-get remove --purge -y
-                    loop_count=$((loop_count + 1))
-                done
-                echo -e "${GREEN}✅ Recursive cleanup completed after $loop_count passes${NC}"
-                log_message "INFO" "Recursive cleanup completed after $loop_count passes"
-                return 0
-            else
-                echo -e "${YELLOW}Cancelled${NC}"
-                return 0
-            fi
+        3)
+            echo -e "${YELLOW}Running full system cleanup...${NC}"
+            cleanup_system
+            return 0
             ;;
-        5)
+        4)
             # Collect all orphans
             local all_orphans=""
             for tmp in /tmp/pihole-*.tmp; do
@@ -760,7 +645,7 @@ remove_orphaned_packages() {
             done
             removal_mode="selected packages"
             ;;
-        6)
+        5)
             echo -e "${YELLOW}Skipping orphaned package removal${NC}"
             log_message "INFO" "Orphan removal skipped"
             return 0
@@ -917,7 +802,7 @@ pre_flight_check() {
     fi
 }
 
-# Install required tools
+# Install required tools (deborphan removed from list)
 install_required_tools() {
     echo -e "\n${BLUE}=== Checking Required Tools ===${NC}"
     log_message "INFO" "Checking required tools"
@@ -939,7 +824,8 @@ install_required_tools() {
         echo -e "${GREEN}✅ dselect already installed${NC}"
     fi
 
-    local tools=("curl" "wget" "git" "dnsutils" "numfmt" "lsb-release" "rfkill" "ethtool" "bc" "lsof" "deborphan")
+    # deborphan removed from this list - using native apt instead
+    local tools=("curl" "wget" "git" "dnsutils" "numfmt" "lsb-release" "rfkill" "ethtool" "bc" "lsof")
     local installed_count=0
 
     for tool in "${tools[@]}"; do
@@ -1436,7 +1322,6 @@ quick_system_info() {
 
     echo -e "${GREEN}D-Bus:${NC} $(systemctl is-active dbus)"
     echo -e "${GREEN}Failed Services:${NC} $(systemctl --failed | grep -c "loaded failed" || echo "0")"
-    echo -e "${GREEN}deborphan:${NC} $([ "$DEBORPHAN_AVAILABLE" = true ] && echo "Available" || echo "Not available (using fallback)")"
 
     # Show backup stats
     if [ -d "$BACKUP_DIR" ]; then
@@ -1541,10 +1426,8 @@ cleanup_only() {
 
     local before_space=$(df -h / | awk 'NR==2 {print $4}')
 
-    apt autoremove --purge -y
-    apt autoclean -y
-    apt clean
-    journalctl --vacuum-time=7d
+    # Use the new standardized cleanup function
+    cleanup_system
 
     # Safe cleanup with process check
     safe_cleanup
@@ -1721,7 +1604,7 @@ cleanup_snapshots() {
     esac
 }
 
-# ENHANCED: Dry Run Mode with Log Export
+# ENHANCED: Dry Run Mode with Log Export (updated for v2.2.1)
 dry_run_optimization() {
     echo -e "\n${BLUE}=== DRY RUN MODE - Optimization Preview ===${NC}"
     echo -e "${YELLOW}This will show what would be removed without making any changes${NC}\n"
@@ -1742,45 +1625,20 @@ dry_run_optimization() {
         return 1
     fi
 
-    # Show orphaned packages that would be removed
-    echo -e "${PURPLE}Packages that would be removed (orphaned):${NC}"
-    echo "Packages that would be removed (orphaned):" >> "$DRY_RUN_LOG"
+    # Show orphaned packages that would be removed (using native apt)
+    echo -e "${PURPLE}Packages that would be removed (autoremove):${NC}"
+    echo "Packages that would be removed (autoremove):" >> "$DRY_RUN_LOG"
 
-    if command -v deborphan &> /dev/null; then
-        local orphans=$(deborphan)
-        local dev_orphans=$(deborphan --guess-dev 2>/dev/null)
-        local data_orphans=$(deborphan --guess-data 2>/dev/null)
-
-        if [ -n "$orphans" ]; then
-            echo "$orphans" | while read pkg; do
-                local size=$(get_package_size "$pkg")
-                echo -e "  ${YELLOW}→ $pkg ($(numfmt --to=iec ${size}K))${NC}"
-                echo "  → $pkg ($(numfmt --to=iec ${size}K))" >> "$DRY_RUN_LOG"
-            done
-        fi
-        if [ -n "$dev_orphans" ]; then
-            echo "$dev_orphans" | while read pkg; do
-                local size=$(get_package_size "$pkg")
-                echo -e "  ${YELLOW}→ $pkg [dev] ($(numfmt --to=iec ${size}K))${NC}"
-                echo "  → $pkg [dev] ($(numfmt --to=iec ${size}K))" >> "$DRY_RUN_LOG"
-            done
-        fi
-        if [ -n "$data_orphans" ]; then
-            echo "$data_orphans" | while read pkg; do
-                local size=$(get_package_size "$pkg")
-                echo -e "  ${YELLOW}→ $pkg [data] ($(numfmt --to=iec ${size}K))${NC}"
-                echo "  → $pkg [data] ($(numfmt --to=iec ${size}K))" >> "$DRY_RUN_LOG"
-            done
-        fi
+    local autoremove=$(apt-get autoremove --dry-run 2>/dev/null | grep "^Remv" | awk '{print $2}')
+    if [ -n "$autoremove" ]; then
+        echo "$autoremove" | while read pkg; do
+            local size=$(get_package_size "$pkg")
+            echo -e "  ${YELLOW}→ $pkg (autoremovable) ($(numfmt --to=iec ${size}K))${NC}"
+            echo "  → $pkg (autoremovable) ($(numfmt --to=iec ${size}K))" >> "$DRY_RUN_LOG"
+        done
     else
-        local autoremove=$(apt-get autoremove --dry-run 2>/dev/null | grep "^Remv" | awk '{print $2}')
-        if [ -n "$autoremove" ]; then
-            echo "$autoremove" | while read pkg; do
-                local size=$(get_package_size "$pkg")
-                echo -e "  ${YELLOW}→ $pkg (autoremovable) ($(numfmt --to=iec ${size}K))${NC}"
-                echo "  → $pkg (autoremovable) ($(numfmt --to=iec ${size}K))" >> "$DRY_RUN_LOG"
-            done
-        fi
+        echo -e "  ${GREEN}None${NC}"
+        echo "  None" >> "$DRY_RUN_LOG"
     fi
 
     # Show services that would be analyzed for disabling
@@ -1999,7 +1857,7 @@ run_full_optimization() {
     echo -e "${YELLOW}This process will:${NC}"
     echo -e "  1. Auto-clean snapshots older than $SNAPSHOT_RETENTION_DAYS days"
     echo -e "  2. Create a system snapshot (backup)"
-    echo -e "  3. Remove orphaned packages (with smart detection)"
+    echo -e "  3. Remove orphaned packages (with native apt detection)"
     echo -e "  4. Disable unnecessary services"
     echo -e "  5. Apply system optimizations (with smart boot config detection)"
     echo -e "  6. Clean temporary files and logs (with process check)"
@@ -2149,10 +2007,9 @@ run_full_optimization() {
 
     # Step 7: Cleaning system (with process check)
     echo -e "\n${YELLOW}Step 7: Cleaning system...${NC}"
-    apt autoremove --purge -y
-    apt autoclean -y
-    apt clean
-    journalctl --vacuum-size=100M
+
+    # Use the new standardized cleanup function
+    cleanup_system
 
     # Safe cleanup with process check
     safe_cleanup
@@ -2222,7 +2079,8 @@ show_menu() {
     echo -e "${CYAN}║${NC} 11. Cleanup Only (with process check)                        ${CYAN}║${NC}"
     echo -e "${CYAN}║${NC} 12. Cleanup Old Snapshots (manual)                           ${CYAN}║${NC}"
     echo -e "${CYAN}║${NC} 13. DELETE ALL SNAPSHOTS (dangerous)                         ${CYAN}║${NC}"
-    echo -e "${CYAN}║${NC} 14. Check Orphaned Packages Only                             ${CYAN}║${NC}"
+    echo -e "${CYAN}║${NC} 14. Check Orphaned Packages Only (native apt)                ${CYAN}║${NC}"
+    echo -e "${CYAN}║${NC} 15. Run Standard System Cleanup (autoremove+clean)           ${CYAN}║${NC}"
     echo -e "${CYAN}║${NC} 0.  Exit                                                     ${CYAN}║${NC}"
     echo -e "${CYAN}╠══════════════════════════════════════════════════════════════╣${NC}"
     echo -e "${CYAN}║${NC} System: $DETECTED_DISTRO $DETECTED_VERSION"
@@ -2233,7 +2091,6 @@ show_menu() {
     fi
     echo -e "${CYAN}║${NC} Network: $ACTIVE_INTERFACE ($([ "$IS_WIFI_ACTIVE" = true ] && echo "WiFi" || echo "Ethernet"))"
     echo -e "${CYAN}║${NC} Auto-cleanup: Snapshots > ${SNAPSHOT_RETENTION_DAYS} days | Auto-reboot: ${REBOOT_TIMEOUT}s"
-    echo -e "${CYAN}║${NC} deborphan: $([ "$DEBORPHAN_AVAILABLE" = true ] && echo "Available" || echo "Fallback mode")"
     if [ -d "$BACKUP_DIR" ]; then
         local snapshot_count=$(ls -1 "$BACKUP_DIR" 2>/dev/null | wc -l)
         local tmp_processes=$(lsof /tmp 2>/dev/null | grep -v "COMMAND" | wc -l)
@@ -2241,7 +2098,7 @@ show_menu() {
     fi
     echo -e "${CYAN}╚══════════════════════════════════════════════════════════════╝${NC}"
     echo ""
-    read -p "Enter your choice [0-14]: " MENU_CHOICE
+    read -p "Enter your choice [0-15]: " MENU_CHOICE
 }
 
 # ============== MAIN EXECUTION ==============
@@ -2263,9 +2120,6 @@ main() {
     install_required_tools
     verify_dbus
     mkdir -p "$BACKUP_DIR"
-
-    # Check deborphan availability
-    check_deborphan_availability
 
     # Show info screen on first run
     SCRIPT_RUN_COUNT=1
@@ -2331,6 +2185,11 @@ main() {
                 check_orphaned_packages
                 read -p "Press Enter to continue..."
                 ;;
+            15)
+                echo -e "\n${YELLOW}Running standard system cleanup...${NC}"
+                cleanup_system
+                read -p "Press Enter to continue..."
+                ;;
             0)
                 echo -e "\n${GREEN}══════════════════════════════════════════════════════════════${NC}"
                 echo -e "${GREEN}Thank you for using Pi-hole Debian Ultra Script!${NC}"
@@ -2343,8 +2202,7 @@ main() {
                 echo -e "\n${CYAN}══════════════════════════════════════════════════════════════${NC}"
                 echo -e "${CYAN}  \"A stable Pi-hole keeps the internet peaceful!\"${NC}"
                 echo -e "${CYAN}  \"Smart boot config detection for perfect compatibility!\"${NC}"
-                echo -e "${CYAN}  \"Dry Run logs let you review before committing!\"${NC}"
-                echo -e "${CYAN}  \"deborphan detection works on Debian 13+ (Trixie)!\"${NC}"
+                echo -e "${CYAN}  \"Native apt orphan detection for Debian 13+ (Trixie)!\"${NC}"
                 echo -e "${CYAN}══════════════════════════════════════════════════════════════${NC}"
                 log_message "INFO" "Script exited normally"
 
